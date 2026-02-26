@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard – BBCSS Ops</title>
+<link rel="stylesheet" href="css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<div class="app-layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main-content">
+    <div class="topbar">
+      <div class="topbar-title"><span>Dashboard</span> – Live Operations</div>
+      <div class="topbar-meta"><span class="live-dot"></span><span id="liveClock"></span></div>
+    </div>
+    <div class="page-body" id="pageBody">
+      <div class="page-loading"><div class="loading-spinner"></div> Loading…</div>
+    </div>
+  </div>
+</div>
+<div class="toast-container" id="toastContainer"></div>
+<script src="js/config.js"></script>
+<script>
+let currentUser = null;
+
+async function init() {
+  currentUser = await Auth.requireAuth();
+  if (!currentUser) return;
+  document.getElementById('sidebar').innerHTML = renderSidebar(currentUser);
+  setActiveNav();
+  startClock('liveClock');
+  await renderDashboard();
+}
+
+async function renderDashboard() {
+  // Load all data in parallel
+  const today = DateUtil.today();
+  const thisMonth = new Date().getMonth() + 1;
+  const thisYear = new Date().getFullYear();
+
+  const [shiftsRes, incidentsRes, tasksRes, trainingRes, guardsRes] = await Promise.all([
+    _supabase.from('shift_records').select('*, guards(first_name,last_name,guard_id_number,rank_designation,passport_photo_url), units(unit_name)').eq('shift_date', today).eq('is_on_duty', true).order('check_in_time', { ascending: false }).limit(20),
+    _supabase.from('incidents').select('*, units(unit_name)').eq('status', 'Open').order('incident_date', { ascending: false }).limit(10),
+    _supabase.from('tasks').select('*, app_users!tasks_assigned_to_fkey(full_name)').neq('status', 'Completed').order('due_date', { ascending: true }),
+    _supabase.from('training_images').select('*, units(unit_name)').order('created_at', { ascending: false }).limit(15),
+    _supabase.from('guards').select('id, duty_status').eq('duty_status', 'Active')
+  ]);
+
+  const shifts = shiftsRes.data || [];
+  const incidents = incidentsRes.data || [];
+  const tasks = tasksRes.data || [];
+  const trainingImages = trainingRes.data || [];
+  const activeGuards = guardsRes.data || [];
+
+  const overdueTasks = tasks.filter(t => DateUtil.isOverdue(t.due_date));
+
+  document.getElementById('pageBody').innerHTML = `
+    <!-- STAT TILES -->
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <div class="stat-icon">👮</div>
+        <div class="stat-value">${shifts.length}</div>
+        <div class="stat-label">Guards On Duty Now</div>
+      </div>
+      <div class="stat-tile red">
+        <div class="stat-icon">🚨</div>
+        <div class="stat-value">${incidents.length}</div>
+        <div class="stat-label">Open Incidents</div>
+      </div>
+      <div class="stat-tile yellow">
+        <div class="stat-icon">📋</div>
+        <div class="stat-value">${tasks.length}</div>
+        <div class="stat-label">Pending Tasks</div>
+      </div>
+      <div class="stat-tile red">
+        <div class="stat-icon">⏰</div>
+        <div class="stat-value">${overdueTasks.length}</div>
+        <div class="stat-label">Overdue Tasks</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-icon">🛡️</div>
+        <div class="stat-value">${activeGuards.length}</div>
+        <div class="stat-label">Active Guards (Total)</div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <!-- LIVE SHIFT SNAPSHOT -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🟢 Live On-Shift Snapshot</div>
+            <div class="card-subtitle">${DateUtil.format(today)} · ${shifts.length} guards on duty</div>
+          </div>
+          <button class="btn btn-outline btn-sm" onclick="addShiftRecord()">+ Add</button>
+        </div>
+        <div id="shiftList">
+          ${shifts.length === 0 ? `<div class="empty-state"><div class="icon">📭</div><p>No shift records for today yet.</p></div>` :
+            shifts.map(s => `
+              <div class="shift-row">
+                <div class="shift-avatar">
+                  ${s.guards?.passport_photo_url ? `<img src="${s.guards.passport_photo_url}" alt="">` : (s.guards?.first_name?.[0] || '?')}
+                </div>
+                <div class="shift-info">
+                  <div class="shift-name">${s.guards?.first_name || ''} ${s.guards?.last_name || ''} <span class="text-muted fs-12">#${s.guards?.guard_id_number || '-'}</span></div>
+                  <div class="shift-unit">${s.units?.unit_name || '-'} · ${s.guards?.rank_designation || '-'} · ${s.shift_type} Shift</div>
+                </div>
+                <div class="shift-time">${s.check_in_time ? new Date(s.check_in_time).toLocaleTimeString('en-IN', {hour:'2-digit',minute:'2-digit'}) : 'N/A'}</div>
+              </div>`).join('')}
+        </div>
+      </div>
+
+      <!-- INCIDENT SNAPSHOT -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🚨 Incident Snapshot</div>
+            <div class="card-subtitle">${incidents.length} open incidents across units</div>
+          </div>
+          <button class="btn btn-danger btn-sm" onclick="openAddIncident()">+ Report</button>
+        </div>
+        <div id="incidentList">
+          ${incidents.length === 0 ? `<div class="empty-state"><div class="icon">✅</div><p>No open incidents. All clear.</p></div>` :
+            incidents.map(i => `
+              <div class="shift-row" style="cursor:pointer" onclick="viewIncident('${i.id}')">
+                <div style="font-size:20px">${severityIcon(i.severity)}</div>
+                <div class="shift-info">
+                  <div class="shift-name">${i.incident_type || 'Incident'}</div>
+                  <div class="shift-unit">${i.units?.unit_name || '-'} · ${DateUtil.format(i.incident_date)}</div>
+                </div>
+                <span class="badge badge-${severityBadge(i.severity)}">${i.severity}</span>
+              </div>`).join('')}
+        </div>
+      </div>
+    </div>
+
+    <!-- TASKS & TRAINING ROW -->
+    <div class="grid-2">
+      <!-- TO-DO LIST -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📋 Task Tracker</div>
+            <div class="card-subtitle">${overdueTasks.length > 0 ? `<span class="text-red">${overdueTasks.length} overdue</span> · ` : ''}${tasks.length} pending</div>
+          </div>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-ghost btn-sm" onclick="window.location.href='tasks-overdue.html'">Overdue Log</button>
+            ${Auth.isManager(currentUser) ? `<button class="btn btn-outline btn-sm" onclick="openAddTask()">+ Task</button>` : ''}
+          </div>
+        </div>
+        <div id="taskList">
+          ${tasks.length === 0 ? `<div class="empty-state"><div class="icon">✅</div><p>No pending tasks.</p></div>` :
+            tasks.slice(0,12).map(t => renderTaskItem(t)).join('')}
+        </div>
+      </div>
+
+      <!-- TRAINING CAROUSEL -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🎓 Training Gallery</div>
+            <div class="card-subtitle">Latest unit training images</div>
+          </div>
+          <button class="btn btn-outline btn-sm" onclick="openUploadTraining()">⬆ Upload</button>
+        </div>
+        <div id="carouselWrap">
+          ${renderCarousel(trainingImages)}
+        </div>
+      </div>
+    </div>`;
+
+  initCarousel();
+}
+
+function renderTaskItem(t) {
+  const overdue = DateUtil.isOverdue(t.due_date);
+  const days = overdue ? DateUtil.daysOverdue(t.due_date) : 0;
+  return `
+    <div class="task-item ${overdue ? 'overdue' : ''} ${t.is_highlighted ? 'highlighted' : ''}" id="task-${t.id}">
+      <div class="task-check ${t.status === 'Completed' ? 'checked' : ''}" onclick="toggleTask('${t.id}','${t.status}')">
+        ${t.status === 'Completed' ? '✓' : ''}
+      </div>
+      <div class="task-content">
+        <div class="task-title">${t.title}</div>
+        <div class="task-meta">
+          <span>📅 Due: ${DateUtil.format(t.due_date)}</span>
+          <span>👤 ${t.app_users?.full_name || 'Unassigned'}</span>
+          <span class="badge badge-${priorityBadge(t.priority)}">${t.priority}</span>
+          ${overdue ? `<span class="task-overdue-label">⚠ ${days}d overdue</span>` : ''}
+        </div>
+      </div>
+      <div class="task-actions">
+        ${t.is_highlighted ? '<span title="Highlighted">🔖</span>' : ''}
+        ${Auth.isManager(currentUser) ? `<button class="btn btn-ghost btn-xs" onclick="editTask('${t.id}')">✎</button>` : ''}
+      </div>
+    </div>`;
+}
+
+function renderCarousel(images) {
+  if (images.length === 0) return `<div class="empty-state"><div class="icon">🖼️</div><p>No training images uploaded yet.</p></div>`;
+  return `
+    <div class="carousel-wrap">
+      <div class="carousel-track" id="carouselTrack">
+        ${images.map(img => `
+          <div class="carousel-slide">
+            <img src="${img.image_url}" alt="${img.caption || 'Training'}" onerror="this.src='assets/no-image.svg'">
+            <div class="carousel-caption">
+              <div class="unit-name">📍 ${img.unit_name || img.units?.unit_name || 'BBCSS'}</div>
+              <div>${img.caption || ''}</div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:2px">${DateUtil.format(img.upload_date)}</div>
+            </div>
+          </div>`).join('')}
+      </div>
+      <button class="carousel-btn carousel-btn-prev" onclick="carouselPrev()">‹</button>
+      <button class="carousel-btn carousel-btn-next" onclick="carouselNext()">›</button>
+    </div>
+    <div class="carousel-dots" id="carouselDots">
+      ${images.map((_, i) => `<div class="carousel-dot ${i===0?'active':''}" onclick="carouselGo(${i})"></div>`).join('')}
+    </div>`;
+}
+
+let carouselIdx = 0, carouselLen = 0, carouselAuto;
+
+function initCarousel() {
+  const track = document.getElementById('carouselTrack');
+  if (!track) return;
+  carouselLen = track.children.length;
+  carouselAuto = setInterval(carouselNext, 4000);
+}
+
+function carouselGo(idx) {
+  clearInterval(carouselAuto);
+  carouselIdx = idx;
+  const track = document.getElementById('carouselTrack');
+  if (!track) return;
+  track.style.transform = `translateX(-${idx * 100}%)`;
+  document.querySelectorAll('.carousel-dot').forEach((d, i) => d.classList.toggle('active', i === idx));
+  carouselAuto = setInterval(carouselNext, 4000);
+}
+
+function carouselNext() { carouselGo((carouselIdx + 1) % carouselLen); }
+function carouselPrev() { carouselGo((carouselIdx - 1 + carouselLen) % carouselLen); }
+
+// ---- ADD SHIFT RECORD ----
+function addShiftRecord() {
+  Modal.create('shiftModal', '➕ Add Shift Record',
+    `<div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Guard ID</label><input id="sGuardId" class="form-control" type="number" placeholder="Guard ID Number"></div>
+      <div class="form-group"><label class="form-label">Unit</label><select id="sUnitSel" class="form-control"><option value="">Loading…</option></select></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Shift Type</label><select id="sType" class="form-control"><option>Day</option><option>Night</option><option>General</option></select></div>
+      <div class="form-group"><label class="form-label">Check-In Time</label><input id="sCheckIn" type="datetime-local" class="form-control"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Notes</label><textarea id="sNotes" class="form-control" rows="2"></textarea></div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('shiftModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveShift()">Save Record</button>`
+  );
+  Modal.open('shiftModal');
+  loadUnitsSelect('sUnitSel');
+}
+
+async function loadUnitsSelect(selId) {
+  const { data } = await _supabase.from('units').select('id, unit_name').eq('is_active', true).order('unit_name');
+  const sel = document.getElementById(selId);
+  if (!sel || !data) return;
+  sel.innerHTML = '<option value="">Select Unit</option>' + data.map(u => `<option value="${u.id}">${u.unit_name}</option>`).join('');
+}
+
+async function saveShift() {
+  const guardIdNum = parseInt(document.getElementById('sGuardId').value);
+  const unitId = document.getElementById('sUnitSel').value;
+  if (!guardIdNum) { Toast.show('Enter a Guard ID', 'error'); return; }
+  const { data: guard } = await _supabase.from('guards').select('id').eq('guard_id_number', guardIdNum).single();
+  if (!guard) { Toast.show('Guard not found', 'error'); return; }
+  const { error } = await _supabase.from('shift_records').insert({
+    guard_id: guard.id,
+    unit_id: unitId || null,
+    shift_type: document.getElementById('sType').value,
+    check_in_time: document.getElementById('sCheckIn').value || null,
+    is_on_duty: true,
+    notes: document.getElementById('sNotes').value,
+    shift_date: DateUtil.today()
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Shift record added!');
+  Modal.close('shiftModal');
+  renderDashboard();
+}
+
+// ---- ADD INCIDENT ----
+async function openAddIncident() {
+  Modal.create('incModal', '🚨 Report Incident',
+    `<div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Unit</label><select id="iUnit" class="form-control"><option value="">Loading…</option></select></div>
+      <div class="form-group"><label class="form-label">Incident Type</label><input id="iType" class="form-control" placeholder="Theft, Fire, Trespassing…"></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Date & Time</label><input id="iDate" type="datetime-local" class="form-control" value="${new Date().toISOString().slice(0,16)}"></div>
+      <div class="form-group"><label class="form-label">Severity</label>
+        <select id="iSeverity" class="form-control"><option>Low</option><option>Medium</option><option>High</option><option>Critical</option></select>
+      </div>
+    </div>
+    <div class="form-group"><label class="form-label">Description</label><textarea id="iDesc" class="form-control" rows="3"></textarea></div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Reported By</label><input id="iReportedBy" class="form-control" placeholder="Name / Designation"></div>
+      <div class="form-group"><label class="form-label">Management Recommendation</label><input id="iRec" class="form-control" placeholder="Action recommended"></div>
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('incModal')">Cancel</button>
+     <button class="btn btn-danger" onclick="saveIncident()">Report Incident</button>`
+  );
+  Modal.open('incModal');
+  loadUnitsSelect('iUnit');
+}
+
+async function saveIncident() {
+  const unitId = document.getElementById('iUnit').value;
+  const type = document.getElementById('iType').value.trim();
+  if (!type) { Toast.show('Enter incident type', 'error'); return; }
+  const { error } = await _supabase.from('incidents').insert({
+    unit_id: unitId || null,
+    incident_type: type,
+    incident_date: document.getElementById('iDate').value,
+    severity: document.getElementById('iSeverity').value,
+    description: document.getElementById('iDesc').value,
+    reported_by: document.getElementById('iReportedBy').value,
+    management_recommendation: document.getElementById('iRec').value,
+    status: 'Open'
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Incident reported!', 'success');
+  Modal.close('incModal');
+  renderDashboard();
+}
+
+async function viewIncident(id) {
+  const { data: i } = await _supabase.from('incidents').select('*, units(unit_name)').eq('id', id).single();
+  if (!i) return;
+  Modal.create('viewIncModal', `🚨 Incident – ${i.incident_type}`,
+    `<div class="info-grid" style="margin-bottom:14px">
+      <div class="info-item"><div class="info-label">Unit</div><div class="info-value">${i.units?.unit_name || '-'}</div></div>
+      <div class="info-item"><div class="info-label">Date</div><div class="info-value">${DateUtil.format(i.incident_date)}</div></div>
+      <div class="info-item"><div class="info-label">Severity</div><div class="info-value"><span class="badge badge-${severityBadge(i.severity)}">${i.severity}</span></div></div>
+      <div class="info-item"><div class="info-label">Status</div><div class="info-value"><span class="badge badge-${i.status==='Open'?'red':'green'}">${i.status}</span></div></div>
+      <div class="info-item"><div class="info-label">Reported By</div><div class="info-value">${i.reported_by || '-'}</div></div>
+    </div>
+    <div class="form-group"><div class="info-label">Description</div><div style="padding:10px;background:var(--bg-card-dark);border-radius:6px;font-size:13px">${i.description || 'No description.'}</div></div>
+    <div class="form-group"><div class="info-label">Management Recommendation</div><div style="padding:10px;background:var(--bg-card-dark);border-radius:6px;font-size:13px">${i.management_recommendation || '-'}</div></div>
+    ${i.resolution ? `<div class="form-group"><div class="info-label">Resolution</div><div style="padding:10px;background:var(--bg-card-dark);border-radius:6px;font-size:13px">${i.resolution}</div></div>` : ''}`,
+    Auth.isManager(currentUser) ? `<button class="btn btn-ghost" onclick="Modal.close('viewIncModal')">Close</button>
+     <button class="btn btn-outline btn-sm" onclick="resolveIncident('${id}')">Mark Resolved</button>` :
+     `<button class="btn btn-ghost" onclick="Modal.close('viewIncModal')">Close</button>`
+  );
+  Modal.open('viewIncModal');
+}
+
+async function resolveIncident(id) {
+  const res = prompt('Resolution notes:');
+  if (!res) return;
+  await _supabase.from('incidents').update({ status: 'Resolved', resolution: res }).eq('id', id);
+  Toast.show('Incident resolved.'); Modal.close('viewIncModal'); renderDashboard();
+}
+
+// ---- TASKS ----
+function openAddTask() {
+  Modal.create('taskModal', '➕ New Task',
+    `<div class="form-group"><label class="form-label">Task Title</label><input id="tTitle" class="form-control" placeholder="Task description…"></div>
+    <div class="form-group"><label class="form-label">Description</label><textarea id="tDesc" class="form-control" rows="2" placeholder="Additional details…"></textarea></div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Assign To (User ID/Email)</label><input id="tAssignTo" class="form-control" placeholder="Email of assignee"></div>
+      <div class="form-group"><label class="form-label">Unit</label><select id="tUnit" class="form-control"><option value="">All / General</option></select></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Due Date</label><input id="tDue" type="date" class="form-control" min="${DateUtil.today()}"></div>
+      <div class="form-group"><label class="form-label">Priority</label>
+        <select id="tPriority" class="form-control"><option>Normal</option><option>High</option><option>Urgent</option><option>Low</option></select>
+      </div>
+    </div>
+    <div class="form-group" style="display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="tHighlight" style="accent-color:var(--neon);width:16px;height:16px">
+      <label for="tHighlight" style="font-size:13px;color:var(--text-muted)">Highlight this task 🔖</label>
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('taskModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveTask()">Create Task</button>`
+  );
+  Modal.open('taskModal');
+  loadUnitsSelect('tUnit');
+}
+
+async function saveTask() {
+  const title = document.getElementById('tTitle').value.trim();
+  if (!title) { Toast.show('Enter task title', 'error'); return; }
+  const assignEmail = document.getElementById('tAssignTo').value.trim();
+  let assignedTo = null;
+  if (assignEmail) {
+    const { data: u } = await _supabase.from('app_users').select('id').eq('email', assignEmail).single();
+    if (u) assignedTo = u.id;
+  }
+  const session = await Auth.getSession();
+  const { data: me } = await _supabase.from('app_users').select('id').eq('email', session.user.email).single();
+  const { error } = await _supabase.from('tasks').insert({
+    title,
+    description: document.getElementById('tDesc').value,
+    assigned_to: assignedTo,
+    assigned_by: me?.id || null,
+    unit_id: document.getElementById('tUnit').value || null,
+    due_date: document.getElementById('tDue').value || null,
+    priority: document.getElementById('tPriority').value,
+    is_highlighted: document.getElementById('tHighlight').checked,
+    date_assigned: DateUtil.today()
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Task created!'); Modal.close('taskModal'); renderDashboard();
+}
+
+async function editTask(id) {
+  const { data: t } = await _supabase.from('tasks').select('*').eq('id', id).single();
+  if (!t) return;
+  Modal.create('editTaskModal', '✎ Edit Task',
+    `<div class="form-group"><label class="form-label">Title</label><input id="etTitle" class="form-control" value="${t.title || ''}"></div>
+    <div class="form-group"><label class="form-label">Description</label><textarea id="etDesc" class="form-control" rows="2">${t.description || ''}</textarea></div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Due Date</label><input id="etDue" type="date" class="form-control" value="${t.due_date || ''}"></div>
+      <div class="form-group"><label class="form-label">Priority</label>
+        <select id="etPriority" class="form-control">
+          ${['Normal','High','Urgent','Low'].map(p => `<option ${t.priority===p?'selected':''}>${p}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="form-group"><label class="form-label">Status</label>
+      <select id="etStatus" class="form-control">
+        ${['Pending','In Progress','Completed','Cancelled'].map(s => `<option ${t.status===s?'selected':''}>${s}</option>`).join('')}
+      </select>
+    </div>
+    <div id="remarkWrap" class="${t.status==='Completed'?'':'hidden'}">
+      <div class="form-group"><label class="form-label">Completion Remark *</label><textarea id="etRemark" class="form-control" rows="2">${t.completion_remark||''}</textarea></div>
+    </div>
+    <div class="form-group" style="display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="etHighlight" ${t.is_highlighted?'checked':''} style="accent-color:var(--neon);width:16px;height:16px">
+      <label for="etHighlight" style="font-size:13px;color:var(--text-muted)">Highlight this task</label>
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('editTaskModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="updateTask('${id}')">Save Changes</button>`
+  );
+  Modal.open('editTaskModal');
+  document.getElementById('etStatus').addEventListener('change', e => {
+    document.getElementById('remarkWrap').classList.toggle('hidden', e.target.value !== 'Completed');
+  });
+}
+
+async function updateTask(id) {
+  const status = document.getElementById('etStatus').value;
+  const remark = document.getElementById('etRemark')?.value?.trim();
+  if (status === 'Completed' && !remark) { Toast.show('Please add a completion remark', 'error'); return; }
+  const wasOverdue = DateUtil.isOverdue(document.getElementById('etDue').value);
+  const { error } = await _supabase.from('tasks').update({
+    title: document.getElementById('etTitle').value,
+    description: document.getElementById('etDesc').value,
+    due_date: document.getElementById('etDue').value || null,
+    priority: document.getElementById('etPriority').value,
+    status,
+    completion_remark: remark || null,
+    completed_at: status === 'Completed' ? new Date().toISOString() : null,
+    is_highlighted: document.getElementById('etHighlight').checked
+  }).eq('id', id);
+  if (error) { Toast.show(error.message, 'error'); return; }
+  // Log if completed and was overdue
+  if (status === 'Completed' && wasOverdue) {
+    await _supabase.from('overdue_task_log').insert({ task_id: id, days_overdue: DateUtil.daysOverdue(document.getElementById('etDue').value), notes: remark });
+  }
+  Toast.show('Task updated!'); Modal.close('editTaskModal'); renderDashboard();
+}
+
+async function toggleTask(id, currentStatus) {
+  if (currentStatus === 'Completed') return;
+  const remark = prompt('Completion remark (required):');
+  if (!remark) return;
+  const { data: t } = await _supabase.from('tasks').select('due_date').eq('id', id).single();
+  const wasOverdue = t ? DateUtil.isOverdue(t.due_date) : false;
+  await _supabase.from('tasks').update({ status: 'Completed', completion_remark: remark, completed_at: new Date().toISOString() }).eq('id', id);
+  if (wasOverdue) await _supabase.from('overdue_task_log').insert({ task_id: id, days_overdue: DateUtil.daysOverdue(t.due_date), notes: remark });
+  Toast.show('Task completed!'); renderDashboard();
+}
+
+// ---- TRAINING UPLOAD ----
+function openUploadTraining() {
+  Modal.create('trainModal', '⬆ Upload Training Image',
+    `<div class="form-group"><label class="form-label">Unit</label><select id="tiUnit" class="form-control"><option value="">Loading…</option></select></div>
+    <div class="form-group"><label class="form-label">Caption</label><input id="tiCaption" class="form-control" placeholder="Brief description of training…"></div>
+    <div class="upload-zone" onclick="document.getElementById('tiFile').click()">
+      <div class="upload-icon">🖼️</div>
+      <p>Click to select image</p>
+      <p style="font-size:11px;margin-top:4px" id="tiFileName">JPG, PNG up to 5MB</p>
+    </div>
+    <input type="file" id="tiFile" accept="image/*" style="display:none" onchange="document.getElementById('tiFileName').textContent=this.files[0]?.name||'No file selected'">`,
+    `<button class="btn btn-ghost" onclick="Modal.close('trainModal')">Cancel</button>
+     <button class="btn btn-primary" id="tiSaveBtn" onclick="saveTrainingImage()">Upload</button>`
+  );
+  Modal.open('trainModal');
+  loadUnitsSelect('tiUnit');
+}
+
+async function saveTrainingImage() {
+  const file = document.getElementById('tiFile').files[0];
+  const unitId = document.getElementById('tiUnit').value;
+  const caption = document.getElementById('tiCaption').value.trim();
+  if (!file) { Toast.show('Select an image file', 'error'); return; }
+  const btn = document.getElementById('tiSaveBtn');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  try {
+    const url = await FileUpload.uploadTrainingImage(file, unitId || 'general', file.name.replace(/[^a-z0-9.]/gi,'_'));
+    const { data: unitData } = unitId ? await _supabase.from('units').select('unit_name').eq('id', unitId).single() : { data: null };
+    const session = await Auth.getSession();
+    const { data: me } = await _supabase.from('app_users').select('id').eq('email', session.user.email).single();
+    await _supabase.from('training_images').insert({ image_url: url, caption, unit_id: unitId || null, unit_name: unitData?.unit_name || '', uploaded_by: me?.id || null });
+    Toast.show('Training image uploaded!'); Modal.close('trainModal'); renderDashboard();
+  } catch(e) { Toast.show('Upload failed: ' + e.message, 'error'); btn.disabled = false; btn.textContent = 'Upload'; }
+}
+
+// ---- HELPERS ----
+function severityIcon(s) { return {Critical:'🔴',High:'🟠',Medium:'🟡',Low:'🟢'}[s] || '🔵'; }
+function severityBadge(s) { return {Critical:'red',High:'red',Medium:'yellow',Low:'green'}[s] || 'blue'; }
+function priorityBadge(p) { return {Urgent:'red',High:'yellow',Normal:'blue',Low:'gray'}[p] || 'gray'; }
+
+init();
+</script>
+</body>
+</html>

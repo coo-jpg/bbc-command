@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Overdue Task Log – BBCSS Ops</title>
+<link rel="stylesheet" href="css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<div class="app-layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main-content">
+    <div class="topbar">
+      <div class="topbar-title">⏰ <span>Overdue Task</span> Log</div>
+      <div class="topbar-meta"><span id="liveClock"></span></div>
+    </div>
+    <div class="page-body" id="pageBody">
+      <div class="page-loading"><div class="loading-spinner"></div> Loading…</div>
+    </div>
+  </div>
+</div>
+<div class="toast-container"></div>
+<script src="js/config.js"></script>
+<script>
+let currentUser = null;
+
+async function init() {
+  currentUser = await Auth.requireAuth();
+  if (!currentUser) return;
+  document.getElementById('sidebar').innerHTML = renderSidebar(currentUser);
+  setActiveNav();
+  startClock('liveClock');
+  await loadOverdueLogs();
+}
+
+async function loadOverdueLogs() {
+  const { data: logs } = await _supabase
+    .from('overdue_task_log')
+    .select('*, tasks(title, due_date, priority, completion_remark, completed_at, app_users!tasks_assigned_to_fkey(full_name))')
+    .order('logged_at', { ascending: false });
+
+  const { data: currentOverdue } = await _supabase
+    .from('tasks')
+    .select('*, app_users!tasks_assigned_to_fkey(full_name)')
+    .neq('status', 'Completed')
+    .lt('due_date', DateUtil.today())
+    .order('due_date', { ascending: true });
+
+  document.getElementById('pageBody').innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile red">
+        <div class="stat-icon">⏰</div>
+        <div class="stat-value">${currentOverdue?.length || 0}</div>
+        <div class="stat-label">Currently Overdue</div>
+      </div>
+      <div class="stat-tile yellow">
+        <div class="stat-icon">📜</div>
+        <div class="stat-value">${logs?.length || 0}</div>
+        <div class="stat-label">Total Overdue Records</div>
+      </div>
+    </div>
+
+    <!-- CURRENTLY OVERDUE -->
+    <div class="card mb-20">
+      <div class="card-header">
+        <div class="card-title">🔴 Currently Overdue Tasks</div>
+      </div>
+      ${!currentOverdue?.length ? `<div class="empty-state"><div class="icon">✅</div><p>No tasks currently overdue.</p></div>` :
+        `<div class="table-wrap"><table>
+          <thead><tr><th>Task</th><th>Assigned To</th><th>Due Date</th><th>Days Overdue</th><th>Priority</th></tr></thead>
+          <tbody>
+            ${currentOverdue.map(t => `
+              <tr class="overdue">
+                <td><div style="font-weight:600">${t.title}</div><div style="font-size:11px;color:var(--text-muted)">${t.description||''}</div></td>
+                <td>${t.app_users?.full_name || 'Unassigned'}</td>
+                <td style="color:var(--red)">${DateUtil.format(t.due_date)}</td>
+                <td style="color:var(--red);font-weight:700;font-family:'Rajdhani',sans-serif;font-size:18px">${DateUtil.daysOverdue(t.due_date)}d</td>
+                <td><span class="badge badge-${t.priority==='Urgent'?'red':t.priority==='High'?'yellow':'blue'}">${t.priority}</span></td>
+              </tr>`).join('')}
+          </tbody>
+        </table></div>`}
+    </div>
+
+    <!-- OVERDUE HISTORY LOG -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">📜 Overdue Task History</div>
+        <div class="card-subtitle">All tasks that were completed after their due date</div>
+      </div>
+      ${!logs?.length ? `<div class="empty-state"><div class="icon">📭</div><p>No overdue task history yet.</p></div>` :
+        `<div class="table-wrap"><table>
+          <thead><tr><th>Task</th><th>Assigned To</th><th>Was Due</th><th>Days Overdue</th><th>Completed On</th><th>Completion Remark</th></tr></thead>
+          <tbody>
+            ${logs.map(l => `
+              <tr>
+                <td style="font-weight:600">${l.tasks?.title || '-'}</td>
+                <td>${l.tasks?.app_users?.full_name || '-'}</td>
+                <td>${DateUtil.format(l.tasks?.due_date)}</td>
+                <td style="color:var(--red);font-weight:700">${l.days_overdue || 0}d</td>
+                <td>${DateUtil.format(l.tasks?.completed_at)}</td>
+                <td style="color:var(--text-muted)">${l.tasks?.completion_remark || l.notes || '-'}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table></div>`}
+    </div>`;
+}
+
+init();
+</script>
+</body>
+</html>

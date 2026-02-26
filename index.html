@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BBCSS Ops – Login</title>
+<link rel="stylesheet" href="css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<div class="login-page">
+  <div class="login-box">
+    <div class="login-logo">
+      <img src="assets/logo.png" alt="BBCSS" onerror="this.style.display='none'">
+      <h1>BBCSS OPS</h1>
+      <p>Black Belt Commandos Security Systems</p>
+    </div>
+
+    <div id="loginError" class="alert alert-danger hidden"></div>
+
+    <div class="form-group">
+      <label class="form-label">Email Address</label>
+      <input type="email" id="loginEmail" class="form-control" placeholder="your@email.com" autocomplete="email">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Password</label>
+      <input type="password" id="loginPassword" class="form-control" placeholder="••••••••" autocomplete="current-password">
+    </div>
+
+    <button class="btn btn-primary" style="width:100%;justify-content:center;padding:11px;" id="loginBtn" onclick="doLogin()">
+      Sign In to Ops Portal
+    </button>
+
+    <p style="text-align:center;margin-top:16px;font-size:12px;color:var(--text-dim);">
+      Contact your administrator if you don't have access.
+    </p>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="js/config.js"></script>
+<script>
+async function doLogin() {
+  const email = document.getElementById('loginEmail').value.trim();
+  const pass  = document.getElementById('loginPassword').value;
+  const btn   = document.getElementById('loginBtn');
+  const err   = document.getElementById('loginError');
+  err.classList.add('hidden');
+
+  if (!email || !pass) { showErr('Please enter email and password.'); return; }
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+
+  const { data, error } = await _supabase.auth.signInWithPassword({ email, password: pass });
+  if (error) { showErr(error.message); btn.disabled = false; btn.textContent = 'Sign In to Ops Portal'; return; }
+
+  // Check app_users record
+  const { data: appUser } = await _supabase.from('app_users').select('is_active, full_name').eq('email', email).single();
+  if (!appUser) { showErr('No account found. Contact administrator.'); await _supabase.auth.signOut(); btn.disabled = false; btn.textContent = 'Sign In to Ops Portal'; return; }
+  if (!appUser.is_active) { showErr('Your account has been deactivated. Contact administrator.'); await _supabase.auth.signOut(); btn.disabled = false; btn.textContent = 'Sign In to Ops Portal'; return; }
+
+  window.location.href = 'dashboard.html';
+}
+
+function showErr(msg) {
+  const el = document.getElementById('loginError');
+  el.textContent = '⚠ ' + msg;
+  el.classList.remove('hidden');
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// Redirect if already logged in
+(async () => {
+  const { data } = await _supabase.auth.getSession();
+  if (data.session) window.location.href = 'dashboard.html';
+})();
+</script>
+</body>
+</html>

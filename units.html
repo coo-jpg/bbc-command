@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Unit Profiles – BBCSS Ops</title>
+<link rel="stylesheet" href="css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<div class="app-layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main-content">
+    <div class="topbar">
+      <div class="topbar-title">🏢 <span>Unit</span> Profiles</div>
+      <div class="topbar-meta" id="liveClock"></div>
+    </div>
+    <div class="page-body" id="pageBody">
+      <div class="page-loading"><div class="loading-spinner"></div> Loading…</div>
+    </div>
+  </div>
+</div>
+<div class="toast-container"></div>
+<script src="js/config.js"></script>
+<script>
+let currentUser = null, allUnits = [];
+
+async function init() {
+  currentUser = await Auth.requireAuth();
+  if (!currentUser) return;
+  document.getElementById('sidebar').innerHTML = renderSidebar(currentUser);
+  setActiveNav(); startClock('liveClock');
+  await loadUnits();
+}
+
+async function loadUnits() {
+  const { data } = await _supabase.from('units').select('*').order('unit_name');
+  allUnits = data || [];
+  const isManager = Auth.isManager(currentUser);
+
+  document.getElementById('pageBody').innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <div class="stat-icon">🏢</div>
+        <div class="stat-value">${allUnits.filter(u=>u.is_active).length}</div>
+        <div class="stat-label">Active Units</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-icon">👥</div>
+        <div class="stat-value">${allUnits.reduce((a,u)=>a+(u.sanctioned_strength||0),0)}</div>
+        <div class="stat-label">Total Sanctioned Strength</div>
+      </div>
+    </div>
+
+    <div class="card mb-20">
+      <div style="display:flex;gap:12px;align-items:center">
+        <div class="search-bar" style="flex:1">
+          <span class="search-icon">🔍</span>
+          <input type="text" id="unitSearch" placeholder="Search units…" oninput="filterUnits()">
+        </div>
+        ${isManager ? `<button class="btn btn-primary btn-sm" onclick="openAddUnit()">+ New Unit</button>` : ''}
+      </div>
+    </div>
+
+    <div id="unitsGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px">
+      ${allUnits.map(u => unitCard(u)).join('')}
+    </div>`;
+}
+
+function filterUnits() {
+  const q = document.getElementById('unitSearch').value.toLowerCase();
+  const cards = document.querySelectorAll('.unit-list-card');
+  cards.forEach(c => { c.style.display = c.dataset.name.includes(q) || c.dataset.branch.includes(q) ? '' : 'none'; });
+}
+
+function unitCard(u) {
+  return `
+    <div class="card unit-list-card" style="cursor:pointer;transition:all 0.2s" onclick="viewUnit('${u.id}')"
+         data-name="${(u.unit_name||'').toLowerCase()}" data-branch="${(u.branch_jurisdiction||'').toLowerCase()}"
+         onmouseenter="this.style.borderColor='var(--border-bright)'" onmouseleave="this.style.borderColor='var(--border)'">
+      <div class="unit-header" style="margin-bottom:12px">
+        <div class="unit-icon">🏢</div>
+        <div>
+          <div class="unit-title">${u.unit_name}</div>
+          <div class="unit-parent">${u.parent_account||'-'}</div>
+          <div class="unit-branch">📍 ${u.branch_jurisdiction||'-'}</div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted)">
+        <span>👥 Strength: <strong style="color:var(--neon)">${u.sanctioned_strength||0}</strong></span>
+        <span>${u.is_active ? `<span class="badge badge-green">Active</span>` : `<span class="badge badge-gray">Inactive</span>`}</span>
+      </div>
+    </div>`;
+}
+
+async function viewUnit(id) {
+  const { data: u } = await _supabase.from('units').select('*').eq('id', id).single();
+  if (!u) return;
+  const isManager = Auth.isManager(currentUser);
+
+  // Load related data
+  const [guardsRes, resignedRes, incidentsRes, shortagesRes, recsRes, reservesRes, sopsRes] = await Promise.all([
+    _supabase.from('guards').select('id,guard_id_number,first_name,last_name,rank_designation,passport_photo_url,duty_status').eq('unit_id', id).eq('duty_status', 'Active'),
+    _supabase.from('guards').select('id,guard_id_number,first_name,last_name,rank_designation,duty_status,left_date').eq('unit_id', id).neq('duty_status', 'Active'),
+    _supabase.from('incidents').select('*').eq('unit_id', id).order('incident_date', { ascending: false }).limit(10),
+    _supabase.from('unit_shortages').select('*').eq('unit_id', id).order('shortage_date', { ascending: false }).limit(20),
+    _supabase.from('management_recommendations').select('*, app_users!management_recommendations_created_by_fkey(full_name)').eq('unit_id', id).order('created_at', { ascending: false }),
+    _supabase.from('reserves').select('*, guards(first_name,last_name,guard_id_number,rank_designation)').eq('unit_id', id),
+    _supabase.from('unit_sops').select('*').eq('unit_id', id).order('created_at', { ascending: false })
+  ]);
+
+  const guards = guardsRes.data || [];
+  const resigned = resignedRes.data || [];
+  const incidents = incidentsRes.data || [];
+  const shortages = shortagesRes.data || [];
+  const recs = recsRes.data || [];
+  const reserves = reservesRes.data || [];
+  const sops = sopsRes.data || [];
+
+  const totalShortageDays = new Set(shortages.map(s => s.shortage_date)).size;
+
+  Modal.create('unitModal', `🏢 ${u.unit_name}`, `
+    <div class="tabs" id="unitTabs">
+      <div class="tab active" onclick="switchUnitTab('overview')">Overview</div>
+      <div class="tab" onclick="switchUnitTab('guards')">Guards (${guards.length})</div>
+      <div class="tab" onclick="switchUnitTab('incidents')">Incidents (${incidents.length})</div>
+      <div class="tab" onclick="switchUnitTab('ops')">Ops & Shortages</div>
+      <div class="tab" onclick="switchUnitTab('sops')">SOPs</div>
+      <div class="tab" onclick="switchUnitTab('recs')">Mgmt Recs</div>
+    </div>
+
+    <!-- OVERVIEW -->
+    <div id="utOverview">
+      <div class="unit-header">
+        <div class="unit-icon">🏢</div>
+        <div>
+          <div class="unit-title">${u.unit_name}</div>
+          <div class="unit-parent">${u.parent_account||''}</div>
+          <div class="unit-branch">📍 ${u.branch_jurisdiction||''}</div>
+        </div>
+      </div>
+      <div class="info-grid">
+        <div class="info-item"><div class="info-label">Contact Name</div><div class="info-value">${u.contact_name||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Contact Phone</div><div class="info-value">${u.contact_phone||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Contact Email</div><div class="info-value">${u.contact_email||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Escalation Contact</div><div class="info-value">${u.escalation_contact||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Escalation Phone</div><div class="info-value">${u.escalation_phone||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Branch Jurisdiction</div><div class="info-value">${u.branch_jurisdiction||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Sanctioned Strength</div><div class="info-value" style="color:var(--neon);font-weight:700">${u.sanctioned_strength||0}</div></div>
+        <div class="info-item"><div class="info-label">Current Deployed</div><div class="info-value" style="color:${guards.length < (u.sanctioned_strength||0) ? 'var(--yellow)' : 'var(--neon)'};font-weight:700">${guards.length}</div></div>
+      </div>
+      ${u.billing_docs_required?.length ? `
+        <div class="divider"></div>
+        <div class="info-item"><div class="info-label">Billing Documents Required</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${u.billing_docs_required.map(d=>`<span class="badge badge-blue">${d}</span>`).join('')}</div>
+        </div>` : ''}
+      ${u.gmaps_link ? `
+        <div class="divider"></div>
+        <a href="${u.gmaps_link}" target="_blank" class="btn btn-ghost btn-sm">🗺 Open in Google Maps</a>` : ''}
+      ${isManager ? `
+        <div class="divider"></div>
+        <button class="btn btn-outline btn-sm" onclick="openEditUnit('${u.id}')">✎ Edit Unit</button>` : ''}
+    </div>
+
+    <!-- GUARDS -->
+    <div id="utGuards" class="hidden">
+      <div class="section-header">
+        <div class="section-title">Active Guards (${guards.length} / ${u.sanctioned_strength||0} sanctioned)</div>
+      </div>
+      ${guards.length === 0 ? `<div class="empty-state"><div class="icon">👮</div><p>No active guards at this unit.</p></div>` :
+        guards.map(g => `
+          <div class="shift-row" style="cursor:pointer" onclick="Modal.close('unitModal');viewGuardExternal('${g.id}')">
+            <div class="shift-avatar">${g.passport_photo_url ? `<img src="${g.passport_photo_url}">` : g.first_name?.[0]||'?'}</div>
+            <div class="shift-info"><div class="shift-name">${g.first_name} ${g.last_name} <span class="text-muted fs-12">#${g.guard_id_number}</span></div>
+            <div class="shift-unit">${g.rank_designation||'Guard'}</div></div>
+            <span class="badge badge-green">Active</span>
+          </div>`).join('')}
+      <div class="divider"></div>
+      <div class="section-title mt-12">Former / Resigned (${resigned.length})</div>
+      <div style="margin-top:12px">
+        ${resigned.length === 0 ? `<div class="empty-state"><div class="icon">📭</div><p>No records.</p></div>` :
+          resigned.map(g => `
+            <div class="shift-row" style="cursor:pointer" onclick="Modal.close('unitModal');viewGuardExternal('${g.id}')">
+              <div class="shift-avatar" style="opacity:0.7">${g.first_name?.[0]||'?'}</div>
+              <div class="shift-info"><div class="shift-name">${g.first_name} ${g.last_name} #${g.guard_id_number}</div>
+              <div class="shift-unit">${g.rank_designation} · Left: ${DateUtil.format(g.left_date)}</div></div>
+              <span class="badge badge-${g.duty_status==='Resigned'?'yellow':'red'}">${g.duty_status}</span>
+            </div>`).join('')}
+      </div>
+    </div>
+
+    <!-- INCIDENTS -->
+    <div id="utIncidents" class="hidden">
+      <div class="section-header">
+        <div class="section-title">Client Incident Records (${incidents.length})</div>
+        <button class="btn btn-danger btn-sm" onclick="openUnitIncident('${u.id}')">+ Report</button>
+      </div>
+      ${incidents.length === 0 ? `<div class="empty-state"><div class="icon">✅</div><p>No incidents recorded.</p></div>` :
+        `<div class="table-wrap"><table>
+          <thead><tr><th>Date</th><th>Type</th><th>Severity</th><th>Status</th><th>Reported By</th><th>Recommendation</th></tr></thead>
+          <tbody>
+            ${incidents.map(i => `
+              <tr>
+                <td>${DateUtil.format(i.incident_date)}</td>
+                <td><div style="font-weight:600">${i.incident_type||'-'}</div><div style="font-size:11px;color:var(--text-muted)">${i.description||''}</div></td>
+                <td><span class="badge badge-${severityBadge(i.severity)}">${i.severity}</span></td>
+                <td><span class="badge badge-${i.status==='Open'?'red':'green'}">${i.status}</span></td>
+                <td>${i.reported_by||'-'}</td>
+                <td style="font-size:12px;color:var(--text-muted)">${i.management_recommendation||'-'}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table></div>`}
+    </div>
+
+    <!-- OPS & SHORTAGES -->
+    <div id="utOps" class="hidden">
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
+        <div class="stat-tile red"><div class="stat-icon">📉</div><div class="stat-value">${totalShortageDays}</div><div class="stat-label">Shortage Days</div></div>
+        <div class="stat-tile yellow"><div class="stat-icon">👥</div><div class="stat-value">${reserves.length}</div><div class="stat-label">Reserves Listed</div></div>
+        <div class="stat-tile"><div class="stat-icon">📋</div><div class="stat-value">${u.sanctioned_strength||0}</div><div class="stat-label">Sanctioned Strength</div></div>
+      </div>
+      ${u.stats_notes ? `<div class="alert alert-info mb-16">📊 ${u.stats_notes}</div>` : ''}
+
+      <div class="section-header">
+        <div class="section-title">Shortage Log</div>
+        ${isManager ? `<button class="btn btn-outline btn-sm" onclick="openAddShortage('${u.id}')">+ Log Shortage</button>` : ''}
+      </div>
+      ${shortages.length === 0 ? `<div class="empty-state"><div class="icon">✅</div><p>No shortages recorded.</p></div>` :
+        shortages.map(s => `
+          <div class="shortage-item">
+            <div class="shortage-rank">${s.rank||'Guard'}</div>
+            <div class="shortage-count">${s.number_short||s.shortage_count||1}</div>
+            <div class="shortage-info">
+              <div class="shortage-date">📅 ${DateUtil.format(s.shortage_date)}</div>
+              <div class="shortage-reason">${s.reason||'No reason given'}</div>
+            </div>
+          </div>`).join('')}
+
+      <div class="divider"></div>
+      <div class="section-header">
+        <div class="section-title">Reserves List (${reserves.length})</div>
+        ${isManager ? `<button class="btn btn-outline btn-sm" onclick="openAddReserve('${u.id}')">+ Add Reserve</button>` : ''}
+      </div>
+      ${reserves.length === 0 ? `<div class="empty-state"><div class="icon">👮</div><p>No reserves listed.</p></div>` :
+        reserves.map(r => `
+          <div class="shift-row">
+            <div class="shift-avatar">${r.guards?.first_name?.[0]||'?'}</div>
+            <div class="shift-info">
+              <div class="shift-name">${r.guards?.first_name||''} ${r.guards?.last_name||''} #${r.guards?.guard_id_number||'-'}</div>
+              <div class="shift-unit">${r.guards?.rank_designation||'Guard'} · Available: ${DateUtil.format(r.available_from)} – ${DateUtil.format(r.available_to)}</div>
+            </div>
+            ${r.notes ? `<div style="font-size:11px;color:var(--text-muted)">${r.notes}</div>` : ''}
+          </div>`).join('')}
+    </div>
+
+    <!-- SOPs -->
+    <div id="utSops" class="hidden">
+      <div class="section-header">
+        <div class="section-title">Standard Operating Procedures</div>
+        ${isManager ? `<label class="btn btn-outline btn-sm" style="cursor:pointer">⬆ Upload SOP <input type="file" accept=".pdf,.doc,.docx" style="display:none" onchange="uploadSop(event,'${u.id}')"></label>` : ''}
+      </div>
+      ${sops.length === 0 ? `<div class="empty-state"><div class="icon">📄</div><p>No SOPs uploaded yet.</p></div>` :
+        sops.map(s => `
+          <div class="rec-item">
+            <div class="rec-header">
+              <div class="rec-text">📄 ${s.sop_name}</div>
+              <a href="${s.sop_url}" target="_blank" class="btn btn-ghost btn-xs">View</a>
+            </div>
+            <div class="rec-meta">Uploaded by ${s.uploaded_by||'Unknown'} on ${DateUtil.format(s.created_at)}</div>
+          </div>`).join('')}
+    </div>
+
+    <!-- MGMT RECS -->
+    <div id="utRecs" class="hidden">
+      <div class="section-header">
+        <div class="section-title">Management Recommendations</div>
+        ${isManager ? `<button class="btn btn-outline btn-sm" onclick="openAddRec('${u.id}')">+ Add Rec</button>` : ''}
+      </div>
+      ${recs.length === 0 ? `<div class="empty-state"><div class="icon">📋</div><p>No recommendations yet.</p></div>` :
+        recs.map(r => `
+          <div class="rec-item">
+            <div class="rec-header">
+              <span class="badge badge-${r.priority==='High'?'red':r.priority==='Normal'?'blue':'gray'}">${r.priority}</span>
+              <span class="badge badge-${r.status==='Pending'?'yellow':'green'}">${r.status}</span>
+            </div>
+            <div class="rec-text" style="margin-top:6px">${r.recommendation}</div>
+            <div class="rec-meta">By ${r.app_users?.full_name||'Manager'} · ${DateUtil.format(r.created_at)}</div>
+          </div>`).join('')}
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('unitModal')">Close</button>`,
+    true
+  );
+  Modal.open('unitModal');
+}
+
+function switchUnitTab(tab) {
+  const tabMap = { overview: 'utOverview', guards: 'utGuards', incidents: 'utIncidents', ops: 'utOps', sops: 'utSops', recs: 'utRecs' };
+  Object.values(tabMap).forEach(id => document.getElementById(id)?.classList.add('hidden'));
+  document.getElementById(tabMap[tab])?.classList.remove('hidden');
+  document.querySelectorAll('#unitTabs .tab').forEach(t => {
+    t.classList.toggle('active', t.getAttribute('onclick')?.includes(`'${tab}'`));
+  });
+}
+
+function viewGuardExternal(id) { window.location.href = `guards.html#${id}`; }
+
+function severityBadge(s) { return {Critical:'red',High:'red',Medium:'yellow',Low:'green'}[s] || 'blue'; }
+
+async function uploadSop(event, unitId) {
+  const file = event.target.files[0];
+  if (!file) return;
+  Toast.show('Uploading SOP…', 'info');
+  try {
+    const url = await FileUpload.uploadUnitSop(file, unitId, file.name);
+    const session = await Auth.getSession();
+    const { data: me } = await _supabase.from('app_users').select('full_name').eq('email', session.user.email).single();
+    await _supabase.from('unit_sops').insert({ unit_id: unitId, sop_name: file.name, sop_url: url, uploaded_by: me?.full_name || 'Manager' });
+    Toast.show('SOP uploaded!'); Modal.close('unitModal'); viewUnit(unitId);
+  } catch(e) { Toast.show('Upload failed: ' + e.message, 'error'); }
+}
+
+async function openAddShortage(unitId) {
+  Modal.create('shortageModal', '📉 Log Shortage',
+    `<div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Date</label><input id="shDate" type="date" class="form-control" value="${DateUtil.today()}"></div>
+      <div class="form-group"><label class="form-label">Rank Short</label><select id="shRank" class="form-control">
+        <option>Security Guard</option><option>Senior Guard</option><option>Supervisor</option><option>Head Guard</option><option>Shift Incharge</option>
+      </select></div>
+    </div>
+    <div class="form-group"><label class="form-label">Number Short</label><input id="shNum" type="number" class="form-control" value="1" min="1"></div>
+    <div class="form-group"><label class="form-label">Reason</label><textarea id="shReason" class="form-control" rows="2" placeholder="Guard absent, resigned, sick leave…"></textarea></div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('shortageModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveShortage('${unitId}')">Log Shortage</button>`
+  );
+  Modal.open('shortageModal');
+}
+
+async function saveShortage(unitId) {
+  const { error } = await _supabase.from('unit_shortages').insert({
+    unit_id: unitId,
+    shortage_date: document.getElementById('shDate').value,
+    rank: document.getElementById('shRank').value,
+    number_short: parseInt(document.getElementById('shNum').value) || 1,
+    reason: document.getElementById('shReason').value
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Shortage logged.'); Modal.close('shortageModal'); Modal.close('unitModal'); viewUnit(unitId);
+}
+
+async function openAddReserve(unitId) {
+  const { data: guards } = await _supabase.from('guards').select('id, guard_id_number, first_name, last_name').eq('duty_status', 'Active').order('first_name');
+  Modal.create('reserveModal', '👮 Add Reserve',
+    `<div class="form-group"><label class="form-label">Guard</label>
+      <select id="rvGuard" class="form-control">
+        <option value="">Select Guard</option>
+        ${(guards||[]).map(g => `<option value="${g.id}">#${g.guard_id_number} – ${g.first_name} ${g.last_name}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Available From</label><input id="rvFrom" type="date" class="form-control" value="${DateUtil.today()}"></div>
+      <div class="form-group"><label class="form-label">Available To</label><input id="rvTo" type="date" class="form-control"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Notes</label><textarea id="rvNotes" class="form-control" rows="2"></textarea></div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('reserveModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveReserve('${unitId}')">Add Reserve</button>`
+  );
+  Modal.open('reserveModal');
+}
+
+async function saveReserve(unitId) {
+  const guardId = document.getElementById('rvGuard').value;
+  if (!guardId) { Toast.show('Select a guard', 'error'); return; }
+  const { error } = await _supabase.from('reserves').insert({
+    unit_id: unitId, guard_id: guardId,
+    available_from: document.getElementById('rvFrom').value || null,
+    available_to: document.getElementById('rvTo').value || null,
+    notes: document.getElementById('rvNotes').value
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Reserve added!'); Modal.close('reserveModal'); Modal.close('unitModal'); viewUnit(unitId);
+}
+
+async function openUnitIncident(unitId) {
+  Modal.create('uIncModal', '🚨 Report Unit Incident',
+    `<div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Incident Type</label><input id="uiType" class="form-control" placeholder="Theft, Fire, Trespassing…"></div>
+      <div class="form-group"><label class="form-label">Date & Time</label><input id="uiDate" type="datetime-local" class="form-control" value="${new Date().toISOString().slice(0,16)}"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Severity</label>
+      <select id="uiSeverity" class="form-control"><option>Low</option><option>Medium</option><option>High</option><option>Critical</option></select>
+    </div>
+    <div class="form-group"><label class="form-label">Description</label><textarea id="uiDesc" class="form-control" rows="3"></textarea></div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Reported By</label><input id="uiReportedBy" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Management Recommendation</label><input id="uiRec" class="form-control"></div>
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('uIncModal')">Cancel</button>
+     <button class="btn btn-danger" onclick="saveUnitIncident('${unitId}')">Report</button>`
+  );
+  Modal.open('uIncModal');
+}
+
+async function saveUnitIncident(unitId) {
+  const type = document.getElementById('uiType').value.trim();
+  if (!type) { Toast.show('Enter incident type', 'error'); return; }
+  const { error } = await _supabase.from('incidents').insert({
+    unit_id: unitId,
+    incident_type: type,
+    incident_date: document.getElementById('uiDate').value,
+    severity: document.getElementById('uiSeverity').value,
+    description: document.getElementById('uiDesc').value,
+    reported_by: document.getElementById('uiReportedBy').value,
+    management_recommendation: document.getElementById('uiRec').value,
+    status: 'Open'
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Incident reported!'); Modal.close('uIncModal'); Modal.close('unitModal'); viewUnit(unitId);
+}
+
+async function openAddRec(unitId) {
+  Modal.create('recModal', '📋 Add Management Recommendation',
+    `<div class="form-group"><label class="form-label">Recommendation *</label><textarea id="recText" class="form-control" rows="3" placeholder="Describe the recommendation…"></textarea></div>
+    <div class="form-group"><label class="form-label">Priority</label>
+      <select id="recPriority" class="form-control"><option>Normal</option><option>High</option><option>Low</option></select>
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('recModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveRec('${unitId}')">Add Recommendation</button>`
+  );
+  Modal.open('recModal');
+}
+
+async function saveRec(unitId) {
+  const text = document.getElementById('recText').value.trim();
+  if (!text) { Toast.show('Enter recommendation text', 'error'); return; }
+  const session = await Auth.getSession();
+  const { data: me } = await _supabase.from('app_users').select('id').eq('email', session.user.email).single();
+  const { error } = await _supabase.from('management_recommendations').insert({
+    unit_id: unitId, recommendation: text,
+    priority: document.getElementById('recPriority').value,
+    created_by: me?.id || null
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Recommendation added!'); Modal.close('recModal'); Modal.close('unitModal'); viewUnit(unitId);
+}
+
+// ---- ADD / EDIT UNIT ----
+function openAddUnit() {
+  Modal.create('addUnitModal', '➕ Add New Unit', `
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Unit Name *</label><input id="unName" class="form-control" placeholder="e.g. Infotech Park – North Wing"></div>
+      <div class="form-group"><label class="form-label">Parent Account</label><input id="unParent" class="form-control" placeholder="Client company name"></div>
+    </div>
+    <div class="form-grid-3">
+      <div class="form-group"><label class="form-label">Contact Name</label><input id="unCont" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Contact Phone</label><input id="unContPhone" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Contact Email</label><input id="unContEmail" class="form-control" type="email"></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Escalation Contact</label><input id="unEsc" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Escalation Phone</label><input id="unEscPhone" class="form-control"></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Branch Jurisdiction</label><input id="unBranch" class="form-control" placeholder="Hyderabad West, Bangalore…"></div>
+      <div class="form-group"><label class="form-label">Sanctioned Strength</label><input id="unStrength" type="number" class="form-control" value="0" min="0"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Billing Docs Required (comma separated)</label>
+      <input id="unBilling" class="form-control" placeholder="Invoice, PO, Attendance Sheet, GST Certificate…">
+    </div>
+    <div class="form-group"><label class="form-label">Google Maps Link</label><input id="unGmaps" class="form-control" placeholder="https://maps.google.com/…"></div>
+    <div class="form-group"><label class="form-label">Stats / Notes</label><textarea id="unStats" class="form-control" rows="2"></textarea></div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('addUnitModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveUnit()">Create Unit</button>`,
+    true
+  );
+  Modal.open('addUnitModal');
+}
+
+async function saveUnit(editId = null) {
+  const name = document.getElementById('unName').value.trim();
+  if (!name) { Toast.show('Unit name required', 'error'); return; }
+  const billing = document.getElementById('unBilling').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const payload = {
+    unit_name: name,
+    parent_account: document.getElementById('unParent').value,
+    contact_name: document.getElementById('unCont').value,
+    contact_phone: document.getElementById('unContPhone').value,
+    contact_email: document.getElementById('unContEmail').value,
+    escalation_contact: document.getElementById('unEsc').value,
+    escalation_phone: document.getElementById('unEscPhone').value,
+    branch_jurisdiction: document.getElementById('unBranch').value,
+    sanctioned_strength: parseInt(document.getElementById('unStrength').value) || 0,
+    billing_docs_required: billing,
+    gmaps_link: document.getElementById('unGmaps').value,
+    stats_notes: document.getElementById('unStats').value
+  };
+  const { error } = editId ?
+    await _supabase.from('units').update(payload).eq('id', editId) :
+    await _supabase.from('units').insert(payload);
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show(editId ? 'Unit updated!' : 'Unit created!');
+  Modal.close('addUnitModal'); await loadUnits();
+}
+
+async function openEditUnit(id) {
+  const { data: u } = await _supabase.from('units').select('*').eq('id', id).single();
+  if (!u) return;
+  Modal.close('unitModal');
+  openAddUnit();
+  setTimeout(() => {
+    document.getElementById('addUnitModal').querySelector('.modal-title').textContent = '✎ Edit Unit';
+    const f = (elId, val) => { const el = document.getElementById(elId); if (el && val !== null && val !== undefined) el.value = val; };
+    f('unName', u.unit_name); f('unParent', u.parent_account); f('unCont', u.contact_name);
+    f('unContPhone', u.contact_phone); f('unContEmail', u.contact_email);
+    f('unEsc', u.escalation_contact); f('unEscPhone', u.escalation_phone);
+    f('unBranch', u.branch_jurisdiction); f('unStrength', u.sanctioned_strength);
+    f('unBilling', (u.billing_docs_required||[]).join(', ')); f('unGmaps', u.gmaps_link); f('unStats', u.stats_notes);
+    document.querySelector('#addUnitModal .btn-primary').setAttribute('onclick', `saveUnit('${id}')`);
+    document.querySelector('#addUnitModal .btn-primary').textContent = 'Save Changes';
+  }, 100);
+}
+
+init();
+</script>
+</body>
+</html>

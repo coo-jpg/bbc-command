@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin Controls – BBCSS Ops</title>
+<link rel="stylesheet" href="css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<div class="app-layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main-content">
+    <div class="topbar">
+      <div class="topbar-title">⚙️ <span>Admin</span> Controls</div>
+      <div class="topbar-meta" id="liveClock"></div>
+    </div>
+    <div class="page-body" id="pageBody">
+      <div class="page-loading"><div class="loading-spinner"></div> Loading…</div>
+    </div>
+  </div>
+</div>
+<div class="toast-container"></div>
+<script src="js/config.js"></script>
+<script>
+let currentUser = null, allAppUsers = [], allRoles = [];
+
+async function init() {
+  currentUser = await Auth.requireAuth();
+  if (!currentUser) return;
+  if (!Auth.isAdmin(currentUser)) {
+    document.getElementById('pageBody').innerHTML = `
+      <div class="empty-state" style="padding:80px">
+        <div class="icon">🔒</div>
+        <p style="font-size:16px;margin-bottom:8px">Access Restricted</p>
+        <p>Admin or Superadmin role required to view this page.</p>
+        <a href="dashboard.html" class="btn btn-outline" style="margin-top:16px">← Back to Dashboard</a>
+      </div>`;
+    document.getElementById('sidebar').innerHTML = renderSidebar(currentUser);
+    return;
+  }
+  document.getElementById('sidebar').innerHTML = renderSidebar(currentUser);
+  setActiveNav(); startClock('liveClock');
+  await loadAdmin();
+}
+
+async function loadAdmin() {
+  const [usersRes, rolesRes] = await Promise.all([
+    _supabase.from('app_users').select('*, user_roles(role_name)').order('created_at', { ascending: false }),
+    _supabase.from('user_roles').select('*')
+  ]);
+  allAppUsers = usersRes.data || [];
+  allRoles = rolesRes.data || [];
+
+  document.getElementById('pageBody').innerHTML = `
+    <!-- STAT TILES -->
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <div class="stat-icon">👥</div>
+        <div class="stat-value">${allAppUsers.length}</div>
+        <div class="stat-label">Total Users</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-icon">✅</div>
+        <div class="stat-value">${allAppUsers.filter(u=>u.is_active).length}</div>
+        <div class="stat-label">Active Accounts</div>
+      </div>
+      <div class="stat-tile red">
+        <div class="stat-icon">🔒</div>
+        <div class="stat-value">${allAppUsers.filter(u=>!u.is_active).length}</div>
+        <div class="stat-label">Deactivated</div>
+      </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="tabs" id="adminTabs">
+      <div class="tab active" onclick="switchAdminTab('users')">👥 User Accounts</div>
+      <div class="tab" onclick="switchAdminTab('roles')">🎭 Roles & Permissions</div>
+      <div class="tab" onclick="switchAdminTab('create')">➕ Create Account</div>
+    </div>
+
+    <!-- USERS TAB -->
+    <div id="atUsers">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">User Accounts</div>
+            <div class="card-subtitle">Manage access and roles for all portal users</div>
+          </div>
+          <div class="search-bar" style="width:220px">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="userSearch" placeholder="Search users…" oninput="filterUsers()">
+          </div>
+        </div>
+        <div id="userList">
+          ${allAppUsers.map(u => userRow(u)).join('')}
+        </div>
+      </div>
+    </div>
+
+    <!-- ROLES TAB -->
+    <div id="atRoles" class="hidden">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Roles & Permission Sets</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Role Name</th><th>Permissions</th><th>Users With Role</th></tr></thead>
+            <tbody>
+              ${allRoles.map(r => `
+                <tr>
+                  <td><strong>${r.role_name}</strong></td>
+                  <td>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px">
+                      ${Object.entries(r.permissions || {}).map(([k,v]) =>
+                        v ? `<span class="badge badge-green">${k}</span>` : ''
+                      ).join('') || '<span class="text-muted fs-12">No permissions set</span>'}
+                    </div>
+                  </td>
+                  <td>${allAppUsers.filter(u => u.role_id === r.id).length}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="divider"></div>
+        <div class="alert alert-info">
+          Roles are: <strong>superadmin</strong> (full access), <strong>admin</strong> (user management + all edits), 
+          <strong>manager</strong> (all edits, no user management), <strong>viewer</strong> (read-only with custom scope).
+        </div>
+      </div>
+    </div>
+
+    <!-- CREATE ACCOUNT TAB -->
+    <div id="atCreate" class="hidden">
+      <div class="card" style="max-width:600px">
+        <div class="card-header">
+          <div class="card-title">➕ Create New User Account</div>
+        </div>
+        <div id="createFormMsg"></div>
+        <div class="form-grid-2">
+          <div class="form-group"><label class="form-label">Full Name *</label><input id="cfName" class="form-control" placeholder="Full name"></div>
+          <div class="form-group"><label class="form-label">Username</label><input id="cfUsername" class="form-control" placeholder="username (optional)"></div>
+        </div>
+        <div class="form-grid-2">
+          <div class="form-group"><label class="form-label">Email Address *</label><input id="cfEmail" class="form-control" type="email" placeholder="email@domain.com"></div>
+          <div class="form-group"><label class="form-label">Password *</label><input id="cfPassword" class="form-control" type="password" placeholder="Min 6 characters" autocomplete="new-password"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Role *</label>
+          <select id="cfRole" class="form-control" onchange="toggleViewerPerms()">
+            ${allRoles.map(r => `<option value="${r.id}" data-name="${r.role_name}">${r.role_name}</option>`).join('')}
+          </select>
+        </div>
+
+        <!-- VIEWER PERMISSIONS -->
+        <div id="viewerPerms" class="hidden">
+          <div class="divider"></div>
+          <div class="card-title" style="margin-bottom:12px">👁 Viewer Access Permissions</div>
+          <div class="alert alert-info mb-16">Select which sections this viewer account can access.</div>
+          <div class="perm-grid">
+            ${[
+              ['view_dashboard', '📊 Dashboard'],
+              ['view_guards', '👮 Guard Profiles'],
+              ['view_guard_personal', '🪪 Guard Personal Info'],
+              ['view_guard_bank', '🏦 Guard Bank Details'],
+              ['view_guard_aadhaar', '🔐 Guard Aadhaar/PAN'],
+              ['view_units', '🏢 Unit Profiles'],
+              ['view_incidents', '🚨 Incidents'],
+              ['view_tasks', '📋 Tasks'],
+              ['view_training', '🎓 Training Images'],
+              ['view_shift_records', '⏰ Shift Records'],
+              ['view_shortages', '📉 Shortage Logs'],
+              ['view_reserves', '👥 Reserves'],
+              ['view_sops', '📄 SOPs'],
+              ['view_recommendations', '📋 Mgmt Recs']
+            ].map(([key, label]) => `
+              <div class="perm-item">
+                <input type="checkbox" id="perm_${key}" value="${key}">
+                <label for="perm_${key}">${label}</label>
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <div class="divider"></div>
+        <div style="display:flex;justify-content:flex-end;gap:10px">
+          <button class="btn btn-ghost" onclick="clearCreateForm()">Clear</button>
+          <button class="btn btn-primary" id="createBtn" onclick="createAccount()">Create Account</button>
+        </div>
+      </div>
+    </div>`;
+
+  toggleViewerPerms();
+}
+
+function userRow(u) {
+  const initials = ((u.full_name || 'U').split(' ').map(w => w[0]).join('').toUpperCase()).slice(0,2);
+  return `
+    <div class="admin-user-row" id="urow-${u.id}">
+      <div class="admin-user-avatar">${initials}</div>
+      <div class="admin-user-info">
+        <div class="admin-user-name">${u.full_name || 'Unnamed'} ${u.username ? `<span class="text-muted fs-12">@${u.username}</span>` : ''}</div>
+        <div class="admin-user-email">${u.email}</div>
+      </div>
+      <span class="badge badge-${roleColor(u.user_roles?.role_name)}" style="margin-right:8px">${u.user_roles?.role_name || 'No Role'}</span>
+      <span class="badge badge-${u.is_active?'green':'red'}" style="margin-right:12px">${u.is_active?'Active':'Deactivated'}</span>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-ghost btn-xs" onclick="openEditUser('${u.id}')">✎ Edit</button>
+        <button class="btn btn-xs ${u.is_active?'btn-danger':'btn-outline'}" onclick="toggleUserActive('${u.id}',${u.is_active})">
+          ${u.is_active ? 'Deactivate' : 'Activate'}
+        </button>
+      </div>
+    </div>`;
+}
+
+function roleColor(role) {
+  return {superadmin:'red',admin:'yellow',manager:'blue',viewer:'gray'}[role?.toLowerCase()] || 'gray';
+}
+
+function filterUsers() {
+  const q = document.getElementById('userSearch').value.toLowerCase();
+  allAppUsers.forEach(u => {
+    const row = document.getElementById(`urow-${u.id}`);
+    if (!row) return;
+    const match = (u.full_name||'').toLowerCase().includes(q) || (u.email||'').toLowerCase().includes(q) || (u.username||'').toLowerCase().includes(q);
+    row.style.display = match ? '' : 'none';
+  });
+}
+
+function switchAdminTab(tab) {
+  const tabMap = { users: 'atUsers', roles: 'atRoles', create: 'atCreate' };
+  Object.values(tabMap).forEach(id => document.getElementById(id)?.classList.add('hidden'));
+  document.getElementById(tabMap[tab])?.classList.remove('hidden');
+  document.querySelectorAll('#adminTabs .tab').forEach(t => {
+    t.classList.toggle('active', t.getAttribute('onclick')?.includes(`'${tab}'`));
+  });
+}
+
+function toggleViewerPerms() {
+  const sel = document.getElementById('cfRole');
+  if (!sel) return;
+  const selectedOption = sel.options[sel.selectedIndex];
+  const roleName = selectedOption?.getAttribute('data-name')?.toLowerCase();
+  const vpDiv = document.getElementById('viewerPerms');
+  if (vpDiv) vpDiv.classList.toggle('hidden', roleName !== 'viewer');
+}
+
+async function createAccount() {
+  const name = document.getElementById('cfName').value.trim();
+  const email = document.getElementById('cfEmail').value.trim();
+  const pass = document.getElementById('cfPassword').value;
+  const roleId = document.getElementById('cfRole').value;
+  const username = document.getElementById('cfUsername').value.trim();
+  const msgEl = document.getElementById('createFormMsg');
+  msgEl.innerHTML = '';
+
+  if (!name || !email || !pass) { msgEl.innerHTML = `<div class="alert alert-danger">Please fill in all required fields.</div>`; return; }
+  if (pass.length < 6) { msgEl.innerHTML = `<div class="alert alert-danger">Password must be at least 6 characters.</div>`; return; }
+
+  const btn = document.getElementById('createBtn');
+  btn.disabled = true; btn.textContent = 'Creating…';
+
+  // Build permissions for viewer
+  const selectedRole = allRoles.find(r => r.id === roleId);
+  let viewPerms = {};
+  if (selectedRole?.role_name?.toLowerCase() === 'viewer') {
+    document.querySelectorAll('[id^=perm_]').forEach(cb => { if (cb.checked) viewPerms[cb.value] = true; });
+  }
+
+  // Create Supabase Auth user via admin (requires service role)
+  // Fallback: use signUp and then create app_users record
+  const { data: authData, error: authErr } = await _supabase.auth.signUp({ email, password: pass, options: { data: { full_name: name } } });
+  if (authErr) {
+    msgEl.innerHTML = `<div class="alert alert-danger">Auth error: ${authErr.message}</div>`;
+    btn.disabled = false; btn.textContent = 'Create Account'; return;
+  }
+
+  // Create app_users record
+  const { error: dbErr } = await _supabase.from('app_users').insert({
+    email, full_name: name, username: username || null,
+    role_id: roleId || null,
+    is_active: true,
+    view_permissions: viewPerms
+  });
+
+  if (dbErr) {
+    msgEl.innerHTML = `<div class="alert alert-danger">DB error: ${dbErr.message}</div>`;
+    btn.disabled = false; btn.textContent = 'Create Account'; return;
+  }
+
+  Toast.show(`✓ Account created for ${name}. They'll receive a confirmation email.`);
+  clearCreateForm();
+  btn.disabled = false; btn.textContent = 'Create Account';
+  await loadAdmin();
+  switchAdminTab('users');
+}
+
+function clearCreateForm() {
+  ['cfName','cfEmail','cfPassword','cfUsername'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.querySelectorAll('[id^=perm_]').forEach(cb => cb.checked = false);
+  document.getElementById('createFormMsg').innerHTML = '';
+}
+
+async function toggleUserActive(id, current) {
+  const action = current ? 'deactivate' : 'activate';
+  if (!confirm(`Are you sure you want to ${action} this account?`)) return;
+  const { error } = await _supabase.from('app_users').update({ is_active: !current }).eq('id', id);
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show(`Account ${current ? 'deactivated' : 'activated'}.`);
+  await loadAdmin();
+}
+
+function openEditUser(id) {
+  const u = allAppUsers.find(x => x.id === id);
+  if (!u) return;
+  Modal.create('editUserModal', `✎ Edit User – ${u.full_name}`, `
+    <div class="form-group"><label class="form-label">Full Name</label><input id="euName" class="form-control" value="${u.full_name||''}"></div>
+    <div class="form-group"><label class="form-label">Username</label><input id="euUsername" class="form-control" value="${u.username||''}"></div>
+    <div class="form-group"><label class="form-label">Role</label>
+      <select id="euRole" class="form-control" onchange="toggleEuViewerPerms()">
+        ${allRoles.map(r => `<option value="${r.id}" data-name="${r.role_name}" ${u.role_id===r.id?'selected':''}>${r.role_name}</option>`).join('')}
+      </select>
+    </div>
+    <div id="euViewerPerms" class="hidden">
+      <div class="divider"></div>
+      <div class="card-title" style="margin-bottom:10px">Viewer Permissions</div>
+      <div class="perm-grid">
+        ${[
+          ['view_dashboard','📊 Dashboard'],['view_guards','👮 Guard Profiles'],
+          ['view_guard_personal','🪪 Personal Info'],['view_guard_bank','🏦 Bank Details'],
+          ['view_guard_aadhaar','🔐 Aadhaar/PAN'],['view_units','🏢 Units'],
+          ['view_incidents','🚨 Incidents'],['view_tasks','📋 Tasks'],
+          ['view_training','🎓 Training'],['view_shift_records','⏰ Shifts'],
+          ['view_shortages','📉 Shortages'],['view_reserves','👥 Reserves'],
+          ['view_sops','📄 SOPs'],['view_recommendations','📋 Mgmt Recs']
+        ].map(([key,label]) => `
+          <div class="perm-item">
+            <input type="checkbox" id="euperm_${key}" value="${key}" ${u.view_permissions?.[key] ? 'checked' : ''}>
+            <label for="euperm_${key}">${label}</label>
+          </div>`).join('')}
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="form-group"><label class="form-label">Reset Password (leave blank to keep current)</label>
+      <input id="euNewPass" class="form-control" type="password" placeholder="New password (optional)" autocomplete="new-password">
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('editUserModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveUserEdit('${id}')">Save Changes</button>`
+  );
+  Modal.open('editUserModal');
+  setTimeout(() => { toggleEuViewerPerms(); }, 100);
+}
+
+function toggleEuViewerPerms() {
+  const sel = document.getElementById('euRole');
+  if (!sel) return;
+  const roleName = sel.options[sel.selectedIndex]?.getAttribute('data-name')?.toLowerCase();
+  document.getElementById('euViewerPerms')?.classList.toggle('hidden', roleName !== 'viewer');
+}
+
+async function saveUserEdit(id) {
+  const name = document.getElementById('euName').value.trim();
+  const username = document.getElementById('euUsername').value.trim();
+  const roleId = document.getElementById('euRole').value;
+  const newPass = document.getElementById('euNewPass').value;
+  const selectedRole = allRoles.find(r => r.id === roleId);
+  let viewPerms = {};
+  if (selectedRole?.role_name?.toLowerCase() === 'viewer') {
+    document.querySelectorAll('[id^=euperm_]').forEach(cb => { if (cb.checked) viewPerms[cb.value] = true; });
+  }
+  const { error } = await _supabase.from('app_users').update({
+    full_name: name, username: username || null, role_id: roleId || null, view_permissions: viewPerms
+  }).eq('id', id);
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('User updated!'); Modal.close('editUserModal'); await loadAdmin();
+}
+
+init();
+</script>
+</body>
+</html>

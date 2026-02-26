@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guard Profiles – BBCSS Ops</title>
+<link rel="stylesheet" href="css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<div class="app-layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main-content">
+    <div class="topbar">
+      <div class="topbar-title">👮 <span>Guard</span> Profiles</div>
+      <div class="topbar-meta" id="liveClock"></div>
+    </div>
+    <div class="page-body" id="pageBody">
+      <div class="page-loading"><div class="loading-spinner"></div> Loading…</div>
+    </div>
+  </div>
+</div>
+<div class="toast-container"></div>
+<script src="js/config.js"></script>
+<script>
+let currentUser = null, allGuards = [], filteredGuards = [], currentFilter = 'all';
+
+async function init() {
+  currentUser = await Auth.requireAuth();
+  if (!currentUser) return;
+  document.getElementById('sidebar').innerHTML = renderSidebar(currentUser);
+  setActiveNav(); startClock('liveClock');
+  await loadPage();
+}
+
+async function loadPage() {
+  const thisMonth = new Date().getMonth() + 1;
+  const thisYear = new Date().getFullYear();
+  const { data: guards } = await _supabase.from('guards').select('*, units(unit_name)').order('guard_id_number');
+  allGuards = guards || [];
+
+  const totalActive = allGuards.filter(g => g.duty_status === 'Active').length;
+  const attrition = allGuards.filter(g => (g.left_month === thisMonth && g.left_year === thisYear)).length;
+
+  document.getElementById('pageBody').innerHTML = `
+    <!-- TOP TILES -->
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <div class="stat-icon">👮</div>
+        <div class="stat-value">${totalActive}</div>
+        <div class="stat-label">Total Active Guards</div>
+      </div>
+      <div class="stat-tile ${attrition > 0 ? 'red' : ''}">
+        <div class="stat-icon">📉</div>
+        <div class="stat-value">${attrition}</div>
+        <div class="stat-label">Attrition This Month</div>
+      </div>
+      <div class="stat-tile yellow">
+        <div class="stat-icon">⚠️</div>
+        <div class="stat-value">${allGuards.filter(g=>g.duty_status==='Resigned').length}</div>
+        <div class="stat-label">Resigned</div>
+      </div>
+      <div class="stat-tile red">
+        <div class="stat-icon">🚫</div>
+        <div class="stat-value">${allGuards.filter(g=>g.duty_status==='Absconding').length}</div>
+        <div class="stat-label">Absconding</div>
+      </div>
+      <div class="stat-tile gold">
+        <div class="stat-icon">⭐</div>
+        <div class="stat-value">${allGuards.filter(g=>g.is_good_performer).length}</div>
+        <div class="stat-label">Good Performers</div>
+      </div>
+    </div>
+
+    <!-- SEARCH & FILTER BAR -->
+    <div class="card mb-20">
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <div class="search-bar" style="flex:1;min-width:220px">
+          <span class="search-icon">🔍</span>
+          <input type="text" id="guardSearch" placeholder="Search by Guard ID, Name, Unit…" oninput="filterGuards()">
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${['all','Active','Resigned','Absconding','Terminated'].map(f =>
+            `<button class="btn btn-sm ${f==='all'?'btn-primary':'btn-ghost'}" id="filter-${f}" onclick="setFilter('${f}')">${f==='all'?'All':f}</button>`
+          ).join('')}
+        </div>
+        ${Auth.isManager(currentUser) ? `<button class="btn btn-primary btn-sm" onclick="openAddGuard()">+ Enrol Guard</button>` : ''}
+      </div>
+    </div>
+
+    <!-- GOOD PERFORMERS -->
+    ${allGuards.filter(g=>g.is_good_performer).length > 0 ? `
+    <div class="performer-banner mb-20">
+      <div class="performer-title">⭐ Star Performers – ${new Date().toLocaleDateString('en-IN',{month:'long',year:'numeric'})}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:10px">
+        ${allGuards.filter(g=>g.is_good_performer).map(g => `
+          <div style="display:flex;align-items:center;gap:8px;background:rgba(255,215,0,0.06);border:1px solid rgba(255,215,0,0.2);border-radius:8px;padding:8px 12px;cursor:pointer" onclick="viewGuard('${g.id}')">
+            <div style="width:32px;height:32px;border-radius:50%;overflow:hidden;background:var(--bg-card-dark);border:1px solid var(--gold);display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--gold)">
+              ${g.passport_photo_url ? `<img src="${g.passport_photo_url}" style="width:100%;height:100%;object-fit:cover">` : g.first_name?.[0]||'?'}
+            </div>
+            <div>
+              <div style="font-size:13px;font-weight:700;color:var(--gold)">${g.first_name} ${g.last_name}</div>
+              <div style="font-size:11px;color:var(--text-muted)">#${g.guard_id_number} · ${g.rank_designation||'-'}</div>
+            </div>
+          </div>`).join('')}
+      </div>
+    </div>` : ''}
+
+    <!-- GUARD GRID -->
+    <div class="guard-grid" id="guardGrid">
+      <div class="page-loading"><div class="loading-spinner"></div></div>
+    </div>`;
+
+  renderGuardGrid(allGuards);
+}
+
+function filterGuards() {
+  const q = document.getElementById('guardSearch').value.toLowerCase().trim();
+  let list = currentFilter === 'all' ? allGuards : allGuards.filter(g => g.duty_status === currentFilter);
+  if (q) list = list.filter(g =>
+    String(g.guard_id_number).includes(q) ||
+    `${g.first_name} ${g.last_name}`.toLowerCase().includes(q) ||
+    (g.unit_name||'').toLowerCase().includes(q) ||
+    (g.rank_designation||'').toLowerCase().includes(q)
+  );
+  renderGuardGrid(list);
+}
+
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll('[id^=filter-]').forEach(b => { b.className = 'btn btn-sm btn-ghost'; });
+  const btn = document.getElementById(`filter-${f}`);
+  if (btn) btn.className = 'btn btn-sm btn-primary';
+  filterGuards();
+}
+
+function renderGuardGrid(guards) {
+  const grid = document.getElementById('guardGrid');
+  if (!grid) return;
+  if (!guards.length) { grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="icon">👮</div><p>No guards found.</p></div>`; return; }
+  grid.innerHTML = guards.map(g => guardCard(g)).join('');
+}
+
+function guardCard(g) {
+  const resigned = g.duty_status === 'Resigned';
+  const absconding = g.duty_status === 'Absconding';
+  const terminated = g.termination_recommended;
+  const docsAlert = (resigned && (!g.resignation_letter_url || !g.last_working_day)) ||
+                    (absconding && !g.absconding_date);
+
+  let cardClass = 'guard-card';
+  if (absconding) cardClass += ' absconding';
+  else if (resigned) cardClass += ' resigned';
+  else if (terminated) cardClass += ' terminated';
+  else if (g.is_good_performer) cardClass += ' good-performer';
+
+  return `
+    <div class="${cardClass}" onclick="viewGuard('${g.id}')">
+      <div class="guard-card-top">
+        <div class="guard-photo">
+          ${g.passport_photo_url ? `<img src="${g.passport_photo_url}" alt="">` : '👤'}
+        </div>
+        <div class="guard-info">
+          <div class="guard-name">${g.first_name||''} ${g.last_name||''}</div>
+          <div class="guard-id">#${g.guard_id_number}</div>
+          <div class="guard-rank">${g.rank_designation||'Guard'}</div>
+          <div class="guard-unit">📍 ${g.unit_name || g.units?.unit_name || 'Unassigned'}</div>
+        </div>
+      </div>
+      <div class="guard-card-badges">
+        <span class="badge badge-${statusBadge(g.duty_status)}">${g.duty_status||'Active'}</span>
+        ${g.is_good_performer ? `<span class="badge badge-gold">⭐ Star</span>` : ''}
+        ${terminated ? `<span class="badge badge-red">⛔ Term. Rec.</span>` : ''}
+        ${g.is_salary_held ? `<span class="badge badge-yellow">💰 Salary Hold</span>` : ''}
+        ${g.penalty_amount > 0 ? `<span class="badge badge-red">⚠ Penalty</span>` : ''}
+      </div>
+      ${docsAlert ? `<div class="guard-card-alert">⚠ Missing documents – action required</div>` : ''}
+      ${g.is_salary_held ? `<div class="salary-hold-banner">💰 Salary on hold: ${g.salary_hold_reason||'No reason given'}</div>` : ''}
+    </div>`;
+}
+
+function statusBadge(s) {
+  return {Active:'green',Resigned:'yellow',Absconding:'red',Terminated:'red',Suspended:'yellow'}[s] || 'gray';
+}
+
+// ---- VIEW GUARD PROFILE ----
+async function viewGuard(id) {
+  const { data: g } = await _supabase.from('guards').select('*, units(unit_name)').eq('id', id).single();
+  if (!g) return;
+  const isManager = Auth.isManager(currentUser);
+  const docsAlert = (g.duty_status === 'Resigned' && (!g.resignation_letter_url || !g.last_working_day)) ||
+                    (g.duty_status === 'Absconding' && !g.absconding_date);
+
+  Modal.create('guardModal', `👮 ${g.first_name} ${g.last_name} – #${g.guard_id_number}`, `
+    <div style="display:flex;gap:20px;margin-bottom:20px">
+      <div style="width:100px;height:120px;border-radius:8px;overflow:hidden;background:var(--bg-card-dark);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:40px;flex-shrink:0">
+        ${g.passport_photo_url ? `<img src="${g.passport_photo_url}" style="width:100%;height:100%;object-fit:cover">` : '👤'}
+      </div>
+      <div style="flex:1">
+        <div style="font-family:Rajdhani,sans-serif;font-size:22px;font-weight:700;color:var(--text)">${g.first_name||''} ${g.last_name||''}</div>
+        <div style="font-size:13px;color:var(--neon);font-weight:600">#${g.guard_id_number}</div>
+        <div style="font-size:13px;color:var(--text-muted)">${g.rank_designation||'Guard'}</div>
+        <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:4px">
+          <span class="badge badge-${statusBadge(g.duty_status)}">${g.duty_status||'Active'}</span>
+          ${g.is_good_performer ? `<span class="badge badge-gold">⭐ Star Performer</span>` : ''}
+          ${g.termination_recommended ? `<span class="badge badge-red">⛔ Termination Recommended</span>` : ''}
+          ${g.is_salary_held ? `<span class="badge badge-yellow">💰 Salary Hold</span>` : ''}
+        </div>
+        ${docsAlert ? `<div class="alert alert-danger mt-8">⚠ Missing required documents for ${g.duty_status} status.</div>` : ''}
+      </div>
+    </div>
+
+    <div class="tabs" id="guardTabs">
+      <div class="tab active" onclick="switchGuardTab('personal')">Personal</div>
+      <div class="tab" onclick="switchGuardTab('employment')">Employment</div>
+      <div class="tab" onclick="switchGuardTab('docs')">Documents</div>
+      <div class="tab" onclick="switchGuardTab('hr')">HR / Actions</div>
+    </div>
+
+    <div id="gtPersonal">
+      <div class="info-grid">
+        <div class="info-item"><div class="info-label">Date of Birth</div><div class="info-value">${DateUtil.format(g.date_of_birth)}</div></div>
+        <div class="info-item"><div class="info-label">Date of Enrollment</div><div class="info-value">${DateUtil.format(g.date_of_enrollment)}</div></div>
+        <div class="info-item"><div class="info-label">Mobile</div><div class="info-value">${g.mobile||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Alt Phone</div><div class="info-value">${g.alternate_phone||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Marital Status</div><div class="info-value">${g.marital_status||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Spouse</div><div class="info-value">${g.spouse_name||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Languages</div><div class="info-value">${g.languages_known||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Height / Weight</div><div class="info-value">${g.height||'-'} / ${g.weight||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Education</div><div class="info-value">${g.education_qualification||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Identification Marks</div><div class="info-value">${g.identification_marks||'-'}</div></div>
+      </div>
+      <div class="divider"></div>
+      <div class="info-item"><div class="info-label">Present Address</div><div class="info-value">${g.present_address||'-'}</div></div>
+      <div class="info-item mt-8"><div class="info-label">Family Address</div><div class="info-value">${g.family_address||'-'}</div></div>
+      <div class="divider"></div>
+      <div class="info-grid">
+        <div class="info-item"><div class="info-label">Emergency Contact</div><div class="info-value">${g.emergency_contact_name||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Emergency Phone</div><div class="info-value">${g.emergency_contact_phone||'-'}</div></div>
+      </div>
+    </div>
+
+    <div id="gtEmployment" class="hidden">
+      <div class="info-grid">
+        <div class="info-item"><div class="info-label">Unit</div><div class="info-value">${g.unit_name || g.units?.unit_name || '-'}</div></div>
+        <div class="info-item"><div class="info-label">Rank / Designation</div><div class="info-value">${g.rank_designation||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Recruited By</div><div class="info-value">${g.recruited_by||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Previous Experience</div><div class="info-value">${g.previous_experience||'-'} ${g.previous_experience_field ? `(${g.previous_experience_field})` : ''}</div></div>
+        <div class="info-item"><div class="info-label">Aadhaar</div><div class="info-value">${g.aadhaar_number||'-'}</div></div>
+        <div class="info-item"><div class="info-label">PAN</div><div class="info-value">${g.pan_number||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Bank Account</div><div class="info-value">${g.bank_account_number||'-'}</div></div>
+        <div class="info-item"><div class="info-label">IFSC / Branch</div><div class="info-value">${g.ifsc_code||'-'} / ${g.bank_branch_name||'-'}</div></div>
+      </div>
+      ${g.duty_status === 'Resigned' ? `<div class="divider"></div>
+        <div class="info-grid">
+          <div class="info-item"><div class="info-label" style="color:var(--yellow)">Resignation Letter</div><div class="info-value">${g.resignation_letter_url ? `<a href="${g.resignation_letter_url}" target="_blank">View Document</a>` : '<span style="color:var(--red)">⚠ Missing</span>'}</div></div>
+          <div class="info-item"><div class="info-label" style="color:var(--yellow)">Last Working Day</div><div class="info-value">${g.last_working_day ? DateUtil.format(g.last_working_day) : '<span style="color:var(--red)">⚠ Not Set</span>'}</div></div>
+        </div>` : ''}
+      ${g.duty_status === 'Absconding' ? `<div class="divider"></div>
+        <div class="alert alert-danger">🚫 Absconding since: ${DateUtil.format(g.absconding_date) || '⚠ Date not set'}</div>
+        <div class="info-item"><div class="info-label">Absconding Note</div><div class="info-value">${g.absconding_note||'-'}</div></div>` : ''}
+    </div>
+
+    <div id="gtDocs" class="hidden">
+      <div class="info-grid">
+        ${docLink('Passport Photo', g.passport_photo_url)}
+        ${docLink('Address Proof', g.address_proof_url)}
+        ${docLink('Bank Proof', g.bank_proof_url)}
+        ${docLink('Education Proof', g.education_proof_url)}
+        ${docLink('Fingerprint Photo', g.fingerprint_photo_url)}
+        ${docLink('Resignation Letter', g.resignation_letter_url)}
+      </div>
+      ${isManager ? `<div class="divider"></div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">Upload new documents:</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          <label class="btn btn-ghost btn-sm" style="cursor:pointer">📷 Photo <input type="file" accept="image/*" style="display:none" onchange="uploadGuardDoc(event,'${g.id}','photo')"></label>
+          <label class="btn btn-ghost btn-sm" style="cursor:pointer">📄 Address Proof <input type="file" style="display:none" onchange="uploadGuardDoc(event,'${g.id}','address_proof')"></label>
+          <label class="btn btn-ghost btn-sm" style="cursor:pointer">🏦 Bank Proof <input type="file" style="display:none" onchange="uploadGuardDoc(event,'${g.id}','bank_proof')"></label>
+          <label class="btn btn-ghost btn-sm" style="cursor:pointer">📚 Education <input type="file" style="display:none" onchange="uploadGuardDoc(event,'${g.id}','education_proof')"></label>
+          <label class="btn btn-ghost btn-sm" style="cursor:pointer">✍ Resignation Letter <input type="file" style="display:none" onchange="uploadGuardDoc(event,'${g.id}','resignation_letter')"></label>
+        </div>` : ''}
+    </div>
+
+    <div id="gtHR" class="hidden">
+      <div class="info-grid" style="margin-bottom:14px">
+        <div class="info-item"><div class="info-label">Performance Note</div><div class="info-value">${g.performance_note||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Remarks</div><div class="info-value">${g.remarks||'-'}</div></div>
+        ${g.penalty_amount > 0 ? `<div class="info-item"><div class="info-label" style="color:var(--red)">Penalty Amount</div><div class="info-value" style="color:var(--red)">₹${g.penalty_amount}</div></div>
+        <div class="info-item"><div class="info-label">Penalty Reason</div><div class="info-value">${g.penalty_reason||'-'}</div></div>` : ''}
+        ${g.is_salary_held ? `<div class="info-item"><div class="info-label" style="color:var(--yellow)">Salary Hold Reason</div><div class="info-value">${g.salary_hold_reason||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Hold Date</div><div class="info-value">${DateUtil.format(g.salary_hold_date)}</div></div>` : ''}
+        ${g.termination_recommended ? `<div class="info-item"><div class="info-label" style="color:var(--red)">Termination Reason</div><div class="info-value">${g.termination_reason||'-'}</div></div>
+        <div class="info-item"><div class="info-label">Term. Recommended On</div><div class="info-value">${DateUtil.format(g.termination_recommended_date)}</div></div>` : ''}
+      </div>
+      ${isManager ? `<div class="divider"></div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">Manager Actions</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          <button class="btn btn-outline btn-sm" onclick="openEditGuard('${g.id}')">✎ Edit Profile</button>
+          <button class="btn btn-sm ${g.is_good_performer?'btn-ghost':'btn-outline'}" onclick="togglePerformer('${g.id}',${g.is_good_performer})">
+            ${g.is_good_performer ? '⭐ Remove Star' : '⭐ Mark Star Performer'}
+          </button>
+          <button class="btn btn-sm ${g.is_salary_held?'btn-danger':'btn-ghost'}" onclick="toggleSalaryHold('${g.id}',${g.is_salary_held})">
+            ${g.is_salary_held ? '💰 Release Salary' : '💰 Hold Salary'}
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick="openPenalty('${g.id}')">⚠ Apply Penalty</button>
+          ${!g.termination_recommended ? `<button class="btn btn-danger btn-sm" onclick="openTermination('${g.id}')">⛔ Recommend Termination</button>` : ''}
+          <button class="btn btn-ghost btn-sm" onclick="openChangeStatus('${g.id}','${g.duty_status}')">🔄 Change Status</button>
+        </div>` : ''}
+    </div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('guardModal')">Close</button>`,
+    true
+  );
+  Modal.open('guardModal');
+}
+
+function switchGuardTab(tab) {
+  document.querySelectorAll('#guardTabs .tab').forEach((t,i) => t.classList.remove('active'));
+  ['personal','employment','docs','hr'].forEach(id => document.getElementById(`gt${id.charAt(0).toUpperCase()+id.slice(1)}`)?.classList.add('hidden'));
+  const tabEl = document.querySelector(`#guardTabs .tab[onclick*="${tab}"]`);
+  if (tabEl) tabEl.classList.add('active');
+  const panel = document.getElementById(`gt${tab.charAt(0).toUpperCase()+tab.slice(1)}`);
+  if (panel) panel.classList.remove('hidden');
+}
+
+function docLink(label, url) {
+  return `<div class="info-item"><div class="info-label">${label}</div><div class="info-value">${url ? `<a href="${url}" target="_blank">📄 View</a>` : '<span style="color:var(--text-dim)">Not uploaded</span>'}</div></div>`;
+}
+
+async function uploadGuardDoc(event, guardId, docType) {
+  const file = event.target.files[0];
+  if (!file) return;
+  Toast.show('Uploading…', 'info');
+  try {
+    let url, updateField;
+    if (docType === 'photo') {
+      url = await FileUpload.uploadGuardPhoto(file, guardId);
+      updateField = { passport_photo_url: url };
+    } else {
+      url = await FileUpload.uploadGuardDoc(file, guardId, docType);
+      updateField = { [`${docType}_url`]: url };
+    }
+    await _supabase.from('guards').update(updateField).eq('id', guardId);
+    Toast.show('Document uploaded!'); Modal.close('guardModal'); viewGuard(guardId);
+  } catch(e) { Toast.show('Upload failed: ' + e.message, 'error'); }
+}
+
+async function togglePerformer(id, current) {
+  if (current) {
+    await _supabase.from('guards').update({ is_good_performer: false, performance_note: null }).eq('id', id);
+    Toast.show('Star performer status removed.');
+  } else {
+    const note = prompt('Performance note (reason for star rating):');
+    if (!note) return;
+    await _supabase.from('guards').update({ is_good_performer: true, performance_note: note }).eq('id', id);
+    Toast.show('⭐ Marked as star performer!');
+  }
+  Modal.close('guardModal'); await loadPage(); viewGuard(id);
+}
+
+async function toggleSalaryHold(id, current) {
+  if (current) {
+    if (!confirm('Release salary hold for this guard?')) return;
+    await _supabase.from('guards').update({ is_salary_held: false, salary_hold_reason: null }).eq('id', id);
+    Toast.show('Salary hold released.');
+  } else {
+    const reason = prompt('Reason for salary hold (required):');
+    if (!reason) return;
+    await _supabase.from('guards').update({ is_salary_held: true, salary_hold_reason: reason, salary_hold_date: DateUtil.today() }).eq('id', id);
+    Toast.show('💰 Salary hold applied.');
+  }
+  Modal.close('guardModal'); await loadPage(); viewGuard(id);
+}
+
+async function openPenalty(id) {
+  const amount = prompt('Penalty amount (₹):');
+  if (!amount || isNaN(amount)) return;
+  const reason = prompt('Reason for penalty:');
+  if (!reason) return;
+  await _supabase.from('guards').update({ penalty_amount: parseFloat(amount), penalty_reason: reason }).eq('id', id);
+  Toast.show(`⚠ Penalty of ₹${amount} applied.`);
+  Modal.close('guardModal'); await loadPage(); viewGuard(id);
+}
+
+async function openTermination(id) {
+  const reason = prompt('Reason for recommending termination:');
+  if (!reason) return;
+  await _supabase.from('guards').update({ termination_recommended: true, termination_reason: reason, termination_recommended_date: DateUtil.today() }).eq('id', id);
+  Toast.show('⛔ Termination recommendation recorded.');
+  Modal.close('guardModal'); await loadPage(); viewGuard(id);
+}
+
+async function openChangeStatus(id, current) {
+  const statuses = ['Active','Resigned','Absconding','Suspended','Terminated'];
+  const choice = prompt(`Change status from "${current}" to:\n${statuses.map((s,i)=>`${i+1}. ${s}`).join('\n')}\n\nEnter number:`);
+  if (!choice) return;
+  const newStatus = statuses[parseInt(choice)-1];
+  if (!newStatus) { Toast.show('Invalid selection', 'error'); return; }
+  const updates = { duty_status: newStatus };
+  if (newStatus === 'Resigned') {
+    updates.left_month = new Date().getMonth()+1;
+    updates.left_year = new Date().getFullYear();
+    updates.left_date = DateUtil.today();
+  }
+  if (newStatus === 'Absconding') updates.absconding_date = DateUtil.today();
+  await _supabase.from('guards').update(updates).eq('id', id);
+  Toast.show(`Status changed to ${newStatus}`);
+  Modal.close('guardModal'); await loadPage(); viewGuard(id);
+}
+
+// ---- ADD GUARD ----
+function openAddGuard() {
+  Modal.create('addGuardModal', '➕ Enrol New Guard', `
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">First Name *</label><input id="agFirst" class="form-control" placeholder="First name"></div>
+      <div class="form-group"><label class="form-label">Last Name *</label><input id="agLast" class="form-control" placeholder="Last name"></div>
+    </div>
+    <div class="form-grid-3">
+      <div class="form-group"><label class="form-label">Guard ID *</label><input id="agId" class="form-control" type="number" placeholder="Unique ID"></div>
+      <div class="form-group"><label class="form-label">Rank / Designation</label><select id="agRank" class="form-control">
+        <option>Security Guard</option><option>Senior Guard</option><option>Supervisor</option><option>Head Guard</option><option>Shift Incharge</option><option>Site Incharge</option><option>Area Manager</option>
+      </select></div>
+      <div class="form-group"><label class="form-label">Unit</label><select id="agUnit" class="form-control"><option value="">Loading…</option></select></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Date of Birth</label><input id="agDob" type="date" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Date of Enrollment</label><input id="agDoe" type="date" class="form-control" value="${DateUtil.today()}"></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Mobile</label><input id="agMobile" class="form-control" placeholder="+91 XXXXX XXXXX"></div>
+      <div class="form-group"><label class="form-label">Alternate Phone</label><input id="agAlt" class="form-control"></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Aadhaar Number</label><input id="agAadhaar" class="form-control" placeholder="XXXX XXXX XXXX"></div>
+      <div class="form-group"><label class="form-label">PAN Number</label><input id="agPan" class="form-control" placeholder="ABCDE1234F"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Present Address</label><textarea id="agAddr" class="form-control" rows="2"></textarea></div>
+    <div class="form-group"><label class="form-label">Family Address</label><textarea id="agFamAddr" class="form-control" rows="2"></textarea></div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Emergency Contact Name</label><input id="agEmName" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Emergency Contact Phone</label><input id="agEmPhone" class="form-control"></div>
+    </div>
+    <div class="form-grid-3">
+      <div class="form-group"><label class="form-label">Marital Status</label><select id="agMarital" class="form-control"><option>Single</option><option>Married</option><option>Widowed</option><option>Divorced</option></select></div>
+      <div class="form-group"><label class="form-label">Spouse Name</label><input id="agSpouse" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Education</label><input id="agEdu" class="form-control" placeholder="10th / 12th / Graduate…"></div>
+    </div>
+    <div class="form-grid-3">
+      <div class="form-group"><label class="form-label">Height</label><input id="agHeight" class="form-control" placeholder='5\'8"'></div>
+      <div class="form-group"><label class="form-label">Weight</label><input id="agWeight" class="form-control" placeholder="70 kg"></div>
+      <div class="form-group"><label class="form-label">Languages Known</label><input id="agLang" class="form-control" placeholder="Hindi, English…"></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Bank Account No.</label><input id="agBank" class="form-control"></div>
+      <div class="form-group"><label class="form-label">IFSC Code</label><input id="agIfsc" class="form-control"></div>
+    </div>
+    <div class="form-grid-2">
+      <div class="form-group"><label class="form-label">Bank Branch Name</label><input id="agBankBranch" class="form-control"></div>
+      <div class="form-group"><label class="form-label">Recruited By</label><input id="agRecruited" class="form-control"></div>
+    </div>
+    <div class="form-group"><label class="form-label">Identification Marks</label><input id="agIdMarks" class="form-control" placeholder="Scar on left hand…"></div>
+    <div class="form-group"><label class="form-label">Previous Experience</label><input id="agExp" class="form-control" placeholder="3 years Army / Security…"></div>
+    <div class="form-group"><label class="form-label">Remarks</label><textarea id="agRemarks" class="form-control" rows="2"></textarea></div>`,
+    `<button class="btn btn-ghost" onclick="Modal.close('addGuardModal')">Cancel</button>
+     <button class="btn btn-primary" onclick="saveGuard()">Enrol Guard</button>`,
+    true
+  );
+  Modal.open('addGuardModal');
+  loadUnitsSelect('agUnit');
+}
+
+async function saveGuard() {
+  const first = document.getElementById('agFirst').value.trim();
+  const last = document.getElementById('agLast').value.trim();
+  const idNum = parseInt(document.getElementById('agId').value);
+  if (!first || !last || !idNum) { Toast.show('Name and Guard ID are required', 'error'); return; }
+  const unitId = document.getElementById('agUnit').value;
+  let unitName = '';
+  if (unitId) {
+    const { data: u } = await _supabase.from('units').select('unit_name').eq('id', unitId).single();
+    unitName = u?.unit_name || '';
+  }
+  const { error } = await _supabase.from('guards').insert({
+    first_name: first, last_name: last, guard_id_number: idNum,
+    rank_designation: document.getElementById('agRank').value,
+    unit_id: unitId || null, unit_name: unitName,
+    date_of_birth: document.getElementById('agDob').value || null,
+    date_of_enrollment: document.getElementById('agDoe').value || null,
+    mobile: document.getElementById('agMobile').value,
+    alternate_phone: document.getElementById('agAlt').value,
+    aadhaar_number: document.getElementById('agAadhaar').value,
+    pan_number: document.getElementById('agPan').value,
+    present_address: document.getElementById('agAddr').value,
+    family_address: document.getElementById('agFamAddr').value,
+    emergency_contact_name: document.getElementById('agEmName').value,
+    emergency_contact_phone: document.getElementById('agEmPhone').value,
+    marital_status: document.getElementById('agMarital').value,
+    spouse_name: document.getElementById('agSpouse').value,
+    education_qualification: document.getElementById('agEdu').value,
+    height: document.getElementById('agHeight').value,
+    weight: document.getElementById('agWeight').value,
+    languages_known: document.getElementById('agLang').value,
+    bank_account_number: document.getElementById('agBank').value,
+    ifsc_code: document.getElementById('agIfsc').value,
+    bank_branch_name: document.getElementById('agBankBranch').value,
+    recruited_by: document.getElementById('agRecruited').value,
+    identification_marks: document.getElementById('agIdMarks').value,
+    previous_experience: document.getElementById('agExp').value,
+    remarks: document.getElementById('agRemarks').value,
+    duty_status: 'Active'
+  });
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Guard enrolled!'); Modal.close('addGuardModal'); await loadPage();
+}
+
+async function loadUnitsSelect(selId) {
+  const { data } = await _supabase.from('units').select('id, unit_name').eq('is_active', true).order('unit_name');
+  const sel = document.getElementById(selId);
+  if (!sel || !data) return;
+  sel.innerHTML = '<option value="">Select Unit</option>' + data.map(u => `<option value="${u.id}">${u.unit_name}</option>`).join('');
+}
+
+async function openEditGuard(id) {
+  Toast.show('Opening edit form…', 'info');
+  const { data: g } = await _supabase.from('guards').select('*').eq('id', id).single();
+  if (!g) return;
+  Modal.close('guardModal');
+  // Re-use add modal but pre-fill
+  openAddGuard();
+  setTimeout(() => {
+    document.getElementById('addGuardModal').querySelector('.modal-title').textContent = '✎ Edit Guard Profile';
+    const f = (id, val) => { const el = document.getElementById(id); if (el && val) el.value = val; };
+    f('agFirst', g.first_name); f('agLast', g.last_name); f('agId', g.guard_id_number);
+    f('agDob', g.date_of_birth); f('agDoe', g.date_of_enrollment);
+    f('agMobile', g.mobile); f('agAlt', g.alternate_phone);
+    f('agAadhaar', g.aadhaar_number); f('agPan', g.pan_number);
+    f('agAddr', g.present_address); f('agFamAddr', g.family_address);
+    f('agEmName', g.emergency_contact_name); f('agEmPhone', g.emergency_contact_phone);
+    f('agSpouse', g.spouse_name); f('agEdu', g.education_qualification);
+    f('agHeight', g.height); f('agWeight', g.weight);
+    f('agLang', g.languages_known); f('agBank', g.bank_account_number);
+    f('agIfsc', g.ifsc_code); f('agBankBranch', g.bank_branch_name);
+    f('agRecruited', g.recruited_by); f('agIdMarks', g.identification_marks);
+    f('agExp', g.previous_experience); f('agRemarks', g.remarks);
+    document.querySelector('#addGuardModal .btn-primary').setAttribute('onclick', `updateGuard('${id}')`);
+    document.querySelector('#addGuardModal .btn-primary').textContent = 'Save Changes';
+    // Load units then set
+    setTimeout(() => { if (g.unit_id) document.getElementById('agUnit').value = g.unit_id; }, 500);
+  }, 100);
+}
+
+async function updateGuard(id) {
+  const first = document.getElementById('agFirst').value.trim();
+  const last = document.getElementById('agLast').value.trim();
+  const idNum = parseInt(document.getElementById('agId').value);
+  if (!first || !last) { Toast.show('Name required', 'error'); return; }
+  const unitId = document.getElementById('agUnit').value;
+  let unitName = '';
+  if (unitId) { const { data: u } = await _supabase.from('units').select('unit_name').eq('id', unitId).single(); unitName = u?.unit_name || ''; }
+  const { error } = await _supabase.from('guards').update({
+    first_name: first, last_name: last, guard_id_number: idNum,
+    rank_designation: document.getElementById('agRank').value,
+    unit_id: unitId || null, unit_name: unitName,
+    date_of_birth: document.getElementById('agDob').value || null,
+    date_of_enrollment: document.getElementById('agDoe').value || null,
+    mobile: document.getElementById('agMobile').value,
+    alternate_phone: document.getElementById('agAlt').value,
+    aadhaar_number: document.getElementById('agAadhaar').value,
+    pan_number: document.getElementById('agPan').value,
+    present_address: document.getElementById('agAddr').value,
+    family_address: document.getElementById('agFamAddr').value,
+    emergency_contact_name: document.getElementById('agEmName').value,
+    emergency_contact_phone: document.getElementById('agEmPhone').value,
+    marital_status: document.getElementById('agMarital').value,
+    spouse_name: document.getElementById('agSpouse').value,
+    education_qualification: document.getElementById('agEdu').value,
+    height: document.getElementById('agHeight').value,
+    weight: document.getElementById('agWeight').value,
+    languages_known: document.getElementById('agLang').value,
+    bank_account_number: document.getElementById('agBank').value,
+    ifsc_code: document.getElementById('agIfsc').value,
+    bank_branch_name: document.getElementById('agBankBranch').value,
+    recruited_by: document.getElementById('agRecruited').value,
+    identification_marks: document.getElementById('agIdMarks').value,
+    previous_experience: document.getElementById('agExp').value,
+    remarks: document.getElementById('agRemarks').value,
+    updated_at: new Date().toISOString()
+  }).eq('id', id);
+  if (error) { Toast.show(error.message, 'error'); return; }
+  Toast.show('Guard profile updated!'); Modal.close('addGuardModal'); await loadPage();
+}
+
+init();
+</script>
+</body>
+</html>
